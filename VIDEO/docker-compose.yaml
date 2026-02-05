@@ -3,6 +3,7 @@ services:
     image: video-service:latest
     container_name: video-service
     user: root
+    runtime: nvidia
 
     # 环境变量文件（用于Docker部署）
     env_file:
@@ -73,7 +74,15 @@ services:
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
-
+      # GPU配置
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
     # 注意：使用host网络模式时，不需要配置extra_hosts
     # 容器直接使用宿主机网络栈，Kafka配置应使用宿主机IP或localhost，不能使用容器名
     # 如果Kafka运行在宿主机上，使用localhost:9092

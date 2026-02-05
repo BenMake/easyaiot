@@ -3,6 +3,7 @@ services:
     image: ai-service:latest
     container_name: ai-service
     user: root
+    runtime: nvidia
 
     # 环境变量文件（用于Docker部署）
     env_file:
@@ -82,6 +83,17 @@ services:
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
+      # GPU配置
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+
+    # 资源限制（GPU 配置，如果 NVIDIA Container Toolkit 未配置，请注释掉以下部分）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all      # 使用全部 GPU
+              capabilities: [gpu]
 
     # 重启策略
     restart: unless-stopped
@@ -95,15 +107,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 90s
-
-    # 资源限制（GPU 配置，如果 NVIDIA Container Toolkit 未配置，请注释掉以下部分）
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all      # 使用全部 GPU
-              capabilities: [gpu]
 
     # 注意：使用network_mode: host后，不再需要networks配置
     # 容器将直接使用宿主机的网络栈，可以：
