@@ -579,6 +579,8 @@ def get_task_streams(task_id):
                 'device_name': device.name or device.id,
                 'http_stream': device.http_stream,
                 'rtmp_stream': device.rtmp_stream,
+                'ai_http_stream': device.ai_http_stream,  # AI HTTP流地址（用于算法任务）
+                'ai_rtmp_stream': device.ai_rtmp_stream,  # AI RTMP流地址（用于算法任务）
                 'source': device.source,
                 'cover_image_path': device.cover_image_path,  # 添加设备封面图字段
             }

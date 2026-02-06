@@ -560,6 +560,8 @@ export interface CameraStreamInfo {
   source?: string;
   pusher_rtmp_url?: string;
   pusher_http_url?: string;
+  ai_http_stream?: string;  // AI HTTP流地址
+  ai_rtmp_stream?: string;  // AI RTMP流地址
   cover_image_path?: string;  // 设备封面图路径
 }
 

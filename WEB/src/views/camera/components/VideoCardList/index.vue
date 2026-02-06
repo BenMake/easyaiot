@@ -55,8 +55,11 @@
                   </div>
                 </div>
                 <div class="btns">
-                  <div class="btn" @click="handlePlay(item)" v-if="item.rtmp_stream">
+                  <div class="btn" @click="handlePlay(item)" v-if="item.rtmp_stream || item.http_stream">
                     <Icon icon="octicon:play-16" :size="15" color="#3B82F6" />
+                  </div>
+                  <div class="btn" @click="handlePlayAI(item)" v-if="item.ai_http_stream || item.ai_rtmp_stream">
+                    <Icon icon="hugeicons:ai-video" :size="15" color="#3B82F6" />
                   </div>
                   <div class="btn" @click="handleView(item)">
                     <Icon icon="ant-design:eye-filled" :size="15" color="#3B82F6" />
@@ -125,7 +128,7 @@ const props = defineProps({
 const { createMessage } = useMessage();
 
 //暴露内部方法
-const emit = defineEmits(['getMethod', 'delete', 'edit', 'view', 'play', 'toggleStream']);
+const emit = defineEmits(['getMethod', 'delete', 'edit', 'view', 'play', 'playAI', 'toggleStream']);
 
 //数据
 const data = ref<DeviceInfo[]>([]);
@@ -378,6 +381,10 @@ async function handlePlay(record: DeviceInfo) {
   emit('play', record);
 }
 
+async function handlePlayAI(record: DeviceInfo) {
+  emit('playAI', record);
+}
+
 async function handleToggleStream(record: DeviceInfo) {
   emit('toggleStream', record);
 }
@@ -540,7 +547,7 @@ defineExpose({
         left: 16px;
         bottom: 16px;
         margin-top: 20px;
-        width: 180px;
+        width: 200px;
         height: 28px;
         border-radius: 45px;
         justify-content: space-around;

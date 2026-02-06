@@ -97,6 +97,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'device-change', device: any): void
   (e: 'device-play', device: any): void
+  (e: 'stream-type-change', type: 'video' | 'ai'): void
 }>()
 
 const {createMessage} = useMessage()
@@ -105,6 +106,7 @@ const expandedKeys = ref<string[]>([])
 const selectedKeys = ref<string[]>([])
 const treeData = ref<TreeItem[]>([])
 const loading = ref(false)
+const streamType = ref<'video' | 'ai'>('video')
 
 // 统计数据
 const statistics = ref({
@@ -289,11 +291,14 @@ const handleTreeSelect = (keys: string[], info: any) => {
     emit('device-change', device)
     
     // 检查是否有流地址，优先使用http_stream（大屏地址使用摄像头的http地址）
-    if (node.device.http_stream || node.device.rtmp_stream) {
+    // 同时传递 AI 流地址
+    if (node.device.http_stream || node.device.rtmp_stream || node.device.ai_http_stream || node.device.ai_rtmp_stream) {
       emit('device-play', {
         ...device,
         http_stream: node.device.http_stream, // 优先传递http_stream
         rtmp_stream: node.device.rtmp_stream,
+        ai_http_stream: node.device.ai_http_stream, // AI HTTP流地址
+        ai_rtmp_stream: node.device.ai_rtmp_stream, // AI RTMP流地址
       })
     }
   }
@@ -365,6 +370,15 @@ const getTotalDeviceCount = (nodes: TreeItem[]): number => {
   }
   countDevices(nodes)
   return count
+}
+
+// 处理流类型切换
+const handleStreamTypeChange = (type: 'video' | 'ai') => {
+  if (streamType.value === type) {
+    return
+  }
+  streamType.value = type
+  emit('stream-type-change', type)
 }
 
 // 刷新定时器
@@ -494,6 +508,67 @@ onUnmounted(() => {
       background: rgba(52, 134, 218, 0.15);
       border-radius: 4px;
       border: 1px solid rgba(52, 134, 218, 0.3);
+    }
+  }
+}
+
+.stream-type-section {
+  flex-shrink: 0;
+}
+
+.stream-type-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  justify-content: flex-start; // 靠左对齐
+}
+
+.tab-item {
+  padding: 8px 16px;
+  background: linear-gradient(135deg, rgba(52, 134, 218, 0.15), rgba(48, 82, 174, 0.1));
+  border: 1px solid rgba(52, 134, 218, 0.3);
+  border-radius: 6px;
+  color: rgba(200, 220, 255, 0.7);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+  position: relative;
+  overflow: hidden;
+
+  &::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(135deg, rgba(52, 134, 218, 0.1), transparent);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  &:hover {
+    border-color: rgba(52, 134, 218, 0.6);
+    color: rgba(200, 220, 255, 0.9);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(52, 134, 218, 0.2);
+
+    &::before {
+      opacity: 1;
+    }
+  }
+
+  &.active {
+    background: linear-gradient(135deg, rgba(52, 134, 218, 0.3), rgba(52, 134, 218, 0.2));
+    border-color: #3486da;
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(52, 134, 218, 0.4);
+    text-shadow: 0 0 8px rgba(52, 134, 218, 0.5);
+
+    &::before {
+      opacity: 1;
     }
   }
 }

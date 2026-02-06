@@ -276,7 +276,6 @@ export default {
       this.jessibuca.cancelMute();
     },
     pause() {
-      alert(111)
       this.jessibuca.pause();
       this.playing = false;
       this.err = "";

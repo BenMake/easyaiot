@@ -10,6 +10,7 @@
         :selected-device="selectedDevice"
         @device-change="handleDeviceChange"
         @device-play="handleDevicePlay"
+        @stream-type-change="handleStreamTypeChange"
       />
       
       <!-- 中央视频监控区域 -->
@@ -272,6 +273,13 @@ const handleDevicePlay = (device: any) => {
 // 处理视频列表变化
 const handleVideoListChange = (videos: any[]) => {
   activeVideos.value = videos
+}
+
+// 处理流类型切换
+const handleStreamTypeChange = (type: 'video' | 'ai') => {
+  if (videoMonitorRef.value) {
+    videoMonitorRef.value.switchStreamType(type)
+  }
 }
 </script>
 

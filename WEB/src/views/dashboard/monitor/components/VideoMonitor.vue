@@ -1,9 +1,24 @@
 <template>
   <div class="video-monitor">
     <div class="monitor-header">
+      <!-- 流类型切换 Tab -->
+      <div class="stream-type-tabs">
+        <div
+          :class="['tab-item', { active: streamType === 'video' }]"
+          @click="switchStreamType('video')"
+        >
+          视频流
+        </div>
+        <div
+          :class="['tab-item', { active: streamType === 'ai' }]"
+          @click="switchStreamType('ai')"
+        >
+          AI流
+        </div>
+      </div>
       <div class="header-title">实时监控</div>
       <div class="header-time">{{ currentTime }}</div>
-      <div class="header-location">{{ device?.location || '未选择设备' }}</div>
+      <div class="header-location">{{ currentLocation }}</div>
       <!-- 分屏切换工具栏 -->
       <div class="split-toolbar">
         <div
@@ -105,7 +120,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { Icon } from '@/components/Icon'
 import { queryAlarmList, queryAlertRecord } from '@/api/device/calculate'
 import { useMessage } from '@/hooks/web/useMessage'
@@ -134,6 +149,7 @@ const [registerPlayerModal, { openModal: openPlayerModal }] = useModal()
 const currentTime = ref('')
 const activeVideoIndex = ref(0)
 const currentLayout = ref('1')
+const streamType = ref<'video' | 'ai'>('video') // 流类型：'video' 视频流，'ai' AI流
 const videoRefs = ref<(InstanceType<typeof Jessibuca> | null)[]>([])
 const alertRecordList = ref<any[]>([])
 const loadingRecords = ref(false)
@@ -237,6 +253,84 @@ const displayVideos = computed(() => {
 const activeVideos = computed(() => {
   return internalVideoList.value.filter(video => video && video.url && video.url.trim() !== '')
 })
+
+// 获取当前应该显示的 location
+const currentLocation = computed(() => {
+  // 如果有正在播放的视频，优先使用第一个视频的 location
+  if (activeVideos.value.length > 0) {
+    const firstVideo = activeVideos.value[0]
+    // 如果视频对象有 location，使用它
+    if (firstVideo.location) {
+      return firstVideo.location
+    }
+    // 如果视频对象没有 location，但 props.device 有，使用 props.device 的 location
+    if (props.device?.location) {
+      return props.device.location
+    }
+  }
+  // 如果没有正在播放的视频，重置为初始状态
+  return '未选择设备'
+})
+
+// 切换流类型
+const switchStreamType = (type: 'video' | 'ai') => {
+  // 如果已经是当前类型，不需要切换
+  if (streamType.value === type) {
+    return
+  }
+  
+  // 1. 完全销毁所有播放器实例（先停止播放，再销毁）
+  videoRefs.value.forEach((ref, index) => {
+    if (ref) {
+      try {
+        // 先尝试停止播放
+        if (ref && typeof ref.pause === 'function') {
+          try {
+            ref.pause()
+          } catch (e) {
+            // 忽略停止播放的错误
+          }
+        }
+        // 再销毁实例
+        if (ref && typeof ref.destroy === 'function') {
+          if (ref.jessibuca) {
+            ref.destroy()
+          }
+        }
+      } catch (error) {
+        console.warn(`销毁播放器 ${index} 时出错:`, error)
+      }
+    }
+  })
+  
+  // 2. 清空所有引用
+  videoRefs.value = []
+  
+  // 3. 清空视频列表
+  internalVideoList.value = []
+  
+  // 4. 重置选中索引
+  activeVideoIndex.value = 0
+  
+  // 5. 更新流类型
+  streamType.value = type
+  
+  // 6. 等待 DOM 更新后重新初始化视频列表（根据当前布局）
+  nextTick(() => {
+    const maxCount = getMaxVideoCount(currentLayout.value)
+    // 确保列表完全清空后再初始化
+    internalVideoList.value = []
+    for (let i = 0; i < maxCount; i++) {
+      internalVideoList.value.push({
+        id: `placeholder-${i}`,
+        url: '',
+        name: `视频${i + 1}`
+      })
+    }
+  })
+  
+  createMessage.success(`已切换到${type === 'video' ? '视频流' : 'AI流'}模式，可以点击左侧设备树播放`)
+}
 
 // 切换布局
 const switchLayout = (layout: string) => {
@@ -345,18 +439,32 @@ const handleVideoClick = (index: number) => {
 const handleVideoRightClick = (index: number, event: MouseEvent) => {
   // 移除该位置的视频流
   if (internalVideoList.value[index]) {
+    // 先清理视频元素
+    if (videoRefs.value[index]) {
+      const jessibucaInstance = videoRefs.value[index]
+      try {
+        // 检查实例是否存在且有效
+        if (jessibucaInstance && typeof jessibucaInstance.destroy === 'function') {
+          // 检查 jessibuca 实例是否存在
+          if (jessibucaInstance.jessibuca) {
+            jessibucaInstance.destroy()
+          }
+        }
+      } catch (error) {
+        console.warn('销毁播放器实例时出错:', error)
+        // 即使销毁失败，也继续清理
+      }
+      // 清空引用
+      videoRefs.value[index] = null
+    }
+    
+    // 更新视频列表
     internalVideoList.value[index] = {
       id: `placeholder-${index}`,
       url: '',
       name: `视频${index + 1}`
     }
-    // 清理视频元素
-    if (videoRefs.value[index]) {
-      const jessibucaInstance = videoRefs.value[index]
-      if (jessibucaInstance && jessibucaInstance.jessibuca) {
-        jessibucaInstance.destroy()
-      }
-    }
+    
     createMessage.success('已移除视频流')
   }
 }
@@ -412,25 +520,42 @@ const findEmptyScreen = (): number | null => {
 
 // 播放设备流
 const playDeviceStream = (device: any) => {
-  // 优先使用HTTP流地址（大屏地址使用摄像头的http地址）
+  // 根据当前流类型选择使用 http_stream 还是 ai_http
   let streamUrl: string | null = null
   
-  // 优先使用HTTP流
-  if (device.http_stream) {
-    streamUrl = device.http_stream
-  } else if (device.device && device.device.http_stream) {
-    // 如果设备对象在device属性中
-    streamUrl = device.device.http_stream
-  } else if (device.rtmp_stream) {
-    // 如果没有http_stream，将RTMP转换为HTTP FLV
-    streamUrl = convertRtmpToHttp(device.rtmp_stream)
-  } else if (device.device && device.device.rtmp_stream) {
-    // 如果设备对象在device属性中
-    streamUrl = convertRtmpToHttp(device.device.rtmp_stream)
+  if (streamType.value === 'ai') {
+    // AI流模式：优先使用 ai_http_stream
+    if (device.ai_http_stream) {
+      streamUrl = device.ai_http_stream
+    } else if (device.device && device.device.ai_http_stream) {
+      streamUrl = device.device.ai_http_stream
+    } else if (device.ai_rtmp_stream) {
+      // 如果没有 ai_http_stream，尝试使用 ai_rtmp_stream 并转换
+      streamUrl = convertRtmpToHttp(device.ai_rtmp_stream)
+    } else if (device.device && device.device.ai_rtmp_stream) {
+      streamUrl = convertRtmpToHttp(device.device.ai_rtmp_stream)
+    } else {
+      createMessage.warning('该摄像头暂无AI流地址')
+      return
+    }
+  } else {
+    // 视频流模式：优先使用HTTP流地址（大屏地址使用摄像头的http地址）
+    if (device.http_stream) {
+      streamUrl = device.http_stream
+    } else if (device.device && device.device.http_stream) {
+      // 如果设备对象在device属性中
+      streamUrl = device.device.http_stream
+    } else if (device.rtmp_stream) {
+      // 如果没有http_stream，将RTMP转换为HTTP FLV
+      streamUrl = convertRtmpToHttp(device.rtmp_stream)
+    } else if (device.device && device.device.rtmp_stream) {
+      // 如果设备对象在device属性中
+      streamUrl = convertRtmpToHttp(device.device.rtmp_stream)
+    }
   }
   
   if (!streamUrl) {
-    createMessage.warning('该摄像头暂无推流地址')
+    createMessage.warning(`该摄像头暂无${streamType.value === 'ai' ? 'AI' : ''}推流地址`)
     return
   }
   
@@ -457,25 +582,62 @@ const playDeviceStream = (device: any) => {
   }
   
   if (targetIndex !== null) {
+    // 如果目标位置已经有视频在播放，先停止并销毁
+    if (videoRefs.value[targetIndex]) {
+      const existingInstance = videoRefs.value[targetIndex]
+      try {
+        if (existingInstance && typeof existingInstance.destroy === 'function') {
+          if (existingInstance.jessibuca) {
+            existingInstance.destroy()
+          }
+        }
+      } catch (error) {
+        console.warn('销毁现有播放器实例失败:', error)
+      }
+      // 清空引用
+      videoRefs.value[targetIndex] = null
+    }
+    
     // 更新视频URL
     internalVideoList.value[targetIndex] = {
       id: `video-${device.id || device.device?.id || 'unknown'}-${targetIndex}`,
       url: streamUrl,
       name: device.name || device.device?.name || device.id || device.device?.id || '未知设备',
-      deviceId: device.id || device.device?.id
+      deviceId: device.id || device.device?.id,
+      location: device.location || device.device?.location || ''
     }
     
-    // 等待DOM更新后播放
-    setTimeout(() => {
-      if (videoRefs.value[targetIndex]) {
+    // 等待DOM更新后播放，使用重试机制确保播放器实例已创建
+    nextTick(() => {
+      let retryCount = 0
+      const maxRetries = 15 // 增加重试次数
+      const retryDelay = 150 // 增加重试延迟
+      
+      const tryPlay = () => {
         const jessibucaInstance = videoRefs.value[targetIndex]
-        if (jessibucaInstance && jessibucaInstance.play) {
-          jessibucaInstance.play()
+        if (jessibucaInstance && typeof jessibucaInstance.play === 'function') {
+          try {
+            jessibucaInstance.play()
+            createMessage.success(`已在屏幕${targetIndex + 1}播放`)
+          } catch (error) {
+            console.error('播放失败:', error)
+            createMessage.error('播放失败，请重试')
+          }
+        } else {
+          // 如果播放器实例还未创建，重试
+          retryCount++
+          if (retryCount < maxRetries) {
+            setTimeout(tryPlay, retryDelay)
+          } else {
+            console.error('播放器实例未创建，无法播放')
+            createMessage.error('播放器初始化失败，请重试')
+          }
         }
       }
-    }, 100)
-    
-    createMessage.success(`已在屏幕${targetIndex + 1}播放`)
+      
+      // 首次尝试延迟稍长，确保DOM完全更新
+      setTimeout(tryPlay, 200)
+    })
   } else {
     // 没有空屏幕，提示用户
     createMessage.warning('当前没有空屏幕，请右键点击占用屏幕移除后再试')
@@ -484,7 +646,8 @@ const playDeviceStream = (device: any) => {
 
 // 暴露方法给父组件
 defineExpose({
-  playDeviceStream
+  playDeviceStream,
+  switchStreamType
 })
 
 // 更新时间
@@ -824,6 +987,44 @@ watch(() => alertRecordList.value, () => {
     font-size: 14px;
     color: rgba(255, 255, 255, 0.6);
     flex: 1;
+  }
+
+  .stream-type-tabs {
+    display: flex;
+    gap: 0;
+    align-items: center;
+    background: rgba(52, 134, 218, 0.15);
+    border-radius: 4px;
+    padding: 2px;
+    border: 1px solid rgba(52, 134, 218, 0.3);
+
+    .tab-item {
+      min-width: 80px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.3s;
+      color: rgba(200, 220, 255, 0.9);
+      font-size: 14px;
+      padding: 0 16px;
+      white-space: nowrap;
+      font-weight: 500;
+
+      &:hover {
+        color: #ffffff;
+        background: rgba(52, 134, 218, 0.2);
+      }
+
+      &.active {
+        background: linear-gradient(135deg, rgba(52, 134, 218, 0.3), rgba(48, 82, 174, 0.2));
+        color: #ffffff;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+    }
   }
 
   .split-toolbar {

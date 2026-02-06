@@ -200,7 +200,7 @@
           <div>
             <div style="font-weight: 500;">{{ stream.device_name }}</div>
             <div style="font-size: 12px; color: #999; margin-top: 4px;">
-              {{ stream.pusher_http_url || stream.http_stream || stream.pusher_rtmp_url || stream.rtmp_stream || '无推流地址' }}
+              {{ stream.ai_http_stream || stream.pusher_http_url || stream.http_stream || stream.pusher_rtmp_url || stream.rtmp_stream || '无推流地址' }}
             </div>
           </div>
         </Radio>
@@ -1044,9 +1044,9 @@ const handlePlayStream = async () => {
     
     cameraStreams.value = streams;
     
-    // 过滤出有推流地址的摄像头（优先检查RTMP地址）
+    // 过滤出有推流地址的摄像头（优先检查AI HTTP流地址）
     const availableStreams = cameraStreams.value.filter(s => 
-      s.pusher_rtmp_url || s.rtmp_stream || s.pusher_http_url || s.http_stream
+      s.ai_http_stream || s.pusher_rtmp_url || s.rtmp_stream || s.pusher_http_url || s.http_stream
     );
     
     if (availableStreams.length === 0) {
@@ -1111,14 +1111,16 @@ const convertRtmpToHttp = (rtmpUrl: string): string | null => {
 
 // 播放摄像头推流
 const playCameraStream = (stream: CameraStreamInfo) => {
-  // 优先使用推送器的RTMP地址，转换为HTTP地址
-  // 其次使用摄像头的RTMP地址，转换为HTTP地址
-  // 最后使用已有的HTTP地址
+  // 优先使用AI HTTP流地址
+  // 其次使用推送器的HTTP地址
+  // 再次使用推送器的RTMP地址，转换为HTTP地址
+  // 然后使用摄像头的HTTP地址
+  // 最后使用摄像头的RTMP地址，转换为HTTP地址
   let httpStream: string | null = null;
   
-  // 1. 优先使用推送器的RTMP地址
-  if (stream.pusher_rtmp_url) {
-    httpStream = convertRtmpToHttp(stream.pusher_rtmp_url);
+  // 1. 优先使用AI HTTP流地址
+  if (stream.ai_http_stream) {
+    httpStream = stream.ai_http_stream;
   }
   
   // 2. 如果没有，使用推送器的HTTP地址
@@ -1126,14 +1128,19 @@ const playCameraStream = (stream: CameraStreamInfo) => {
     httpStream = stream.pusher_http_url;
   }
   
-  // 3. 如果还没有，使用摄像头的RTMP地址
-  if (!httpStream && stream.rtmp_stream) {
-    httpStream = convertRtmpToHttp(stream.rtmp_stream);
+  // 3. 如果还没有，使用推送器的RTMP地址，转换为HTTP地址
+  if (!httpStream && stream.pusher_rtmp_url) {
+    httpStream = convertRtmpToHttp(stream.pusher_rtmp_url);
   }
   
-  // 4. 最后使用摄像头的HTTP地址
+  // 4. 如果还没有，使用摄像头的HTTP地址
   if (!httpStream && stream.http_stream) {
     httpStream = stream.http_stream;
+  }
+  
+  // 5. 最后使用摄像头的RTMP地址，转换为HTTP地址
+  if (!httpStream && stream.rtmp_stream) {
+    httpStream = convertRtmpToHttp(stream.rtmp_stream);
   }
   
   if (!httpStream) {
