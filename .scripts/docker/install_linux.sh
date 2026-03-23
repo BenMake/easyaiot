@@ -130,6 +130,68 @@ print_section() {
     log_to_file ""
 }
 
+# 检测宿主机 IPv4 地址，并导出给子模块安装脚本和 docker compose 使用
+detect_host_ip() {
+    local host_ip=""
+
+    if check_command ip; then
+        host_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    fi
+
+    if [ -z "$host_ip" ] && check_command hostname; then
+        host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+
+    if [ -z "$host_ip" ] && check_command ip; then
+        host_ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1)
+    fi
+
+    if [ -z "$host_ip" ]; then
+        print_error "无法自动检测宿主机 IP，无法为 GB28181/ZLM 注入正确的媒体地址"
+        print_info "请检查 iproute2/hostname 命令是否可用，或手动导出 HOST_IP 后重新执行脚本"
+        return 1
+    fi
+
+    export HOST_IP="$host_ip"
+    print_info "检测到宿主机 IP: $HOST_IP"
+    return 0
+}
+
+# 预留 ZLM RTP 端口段，避免被 Linux 临时端口抢占导致 ZLM 启动或收流异常
+configure_rtp_port_reservation() {
+    local sysctl_file="/etc/sysctl.d/99-zlm-rtp.conf"
+    local expected_config="net.ipv4.ip_local_reserved_ports = 30000-30500"
+
+    if [ "$(uname -s)" != "Linux" ]; then
+        return 0
+    fi
+
+    if [ "$EUID" -ne 0 ]; then
+        print_warning "配置 RTP 端口预留需要 root 权限，已跳过"
+        print_warning "建议使用 sudo 运行安装脚本，以固化 30000-30500 端口预留"
+        return 0
+    fi
+
+    mkdir -p /etc/sysctl.d
+
+    if [ -f "$sysctl_file" ] && grep -Fxq "$expected_config" "$sysctl_file"; then
+        print_info "RTP 端口预留已配置: 30000-30500"
+        return 0
+    fi
+
+    print_info "配置 Linux RTP 端口预留: 30000-30500"
+    cat > "$sysctl_file" << EOF
+$expected_config
+EOF
+    sysctl --system > /dev/null
+    print_success "RTP 端口预留已生效"
+}
+
+prepare_runtime_environment() {
+    detect_host_ip
+    configure_rtp_port_reservation
+}
+
 # 检查命令是否存在
 check_command() {
     if ! command -v "$1" &> /dev/null; then
@@ -716,6 +778,7 @@ install_linux() {
     
     check_docker "$@"
     check_docker_compose
+    prepare_runtime_environment
     configure_docker_mirror
     create_network
     
@@ -808,6 +871,7 @@ start_all() {
     
     check_docker "$@"
     check_docker_compose
+    prepare_runtime_environment
     create_network
     
     # 先启动基础服务（.scripts/docker）
@@ -854,6 +918,7 @@ restart_all() {
     
     check_docker "$@"
     check_docker_compose
+    prepare_runtime_environment
     create_network
     
     for module in "${MODULES[@]}"; do
@@ -947,6 +1012,7 @@ update_all() {
     
     check_docker "$@"
     check_docker_compose
+    prepare_runtime_environment
     create_network
     
     for module in "${MODULES[@]}"; do
@@ -1169,4 +1235,3 @@ if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
     echo ""
     print_info "日志文件已保存到: $LOG_FILE"
 fi
-
