@@ -142,6 +142,8 @@ export const runInference = (modelId, formData) => {
   return defHttp.post({
     url: `${Api.InferenceTask}/${modelId}/inference/run`,
     data: formData,
+    // 推理请求（尤其视频）可能需要较长时间，避免默认10秒超时
+    timeout: 10 * 60 * 1000,
     headers: {
       'Content-Type': 'multipart/form-data',
       'X-Authorization': 'Bearer ' + localStorage.getItem('jwt_token')
@@ -204,6 +206,8 @@ export const uploadInputFile = (formData: FormData) => {
   return defHttp.post({
     url: `${Api.InferenceTask}/upload_input`,
     data: formData,
+    // 上传较大视频文件时需要更长超时
+    timeout: 10 * 60 * 1000,
     headers: {
       'Content-Type': 'multipart/form-data',
       'X-Authorization': 'Bearer ' + localStorage.getItem('jwt_token')
@@ -350,4 +354,3 @@ export const disableExtractor = (cameraName) => {
 export const getExtractorLogs = (cameraName, params) => {
   return commonApi('get', `${Api.DeployService}/extractor/${cameraName}/logs`, {params});
 };
-

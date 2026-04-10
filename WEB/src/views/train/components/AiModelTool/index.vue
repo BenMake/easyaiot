@@ -501,10 +501,11 @@ const state = reactive<AppState>({
   llmsLoading: false
 });
 
-// 轮询超时时间（5分钟）
-const POLLING_TIMEOUT = 5 * 60 * 1000;
-// 轮询间隔（1秒）
-const POLLING_INTERVAL = 1000;
+// 轮询超时时间（30分钟）
+// 视频推理在生产环境可能耗时较长，5分钟容易提前超时
+const POLLING_TIMEOUT = 30 * 60 * 1000;
+// 轮询间隔（2秒），降低接口压力
+const POLLING_INTERVAL = 2000;
 
 const sourceOptions = [
   { value: 'image', label: '图片上传' },
@@ -702,6 +703,31 @@ const startDetection = async () => {
     }
     // 注意：用户上传的模型不需要传递 model_file_path，后端会根据 model_id 从 MinIO 下载
 
+    // 视频推理场景：先上传文件，run接口只传input_source，避免大文件直传导致超时
+    let uploadedVideoInputSource: string | null = null;
+    if (state.activeSource === 'video' && state.uploadedVideoFile) {
+      const uploadFormData = new FormData();
+      uploadFormData.append('file', state.uploadedVideoFile);
+      const uploadResp = await uploadInputFile(uploadFormData);
+      // 兼容三种响应格式：
+      // 1) defHttp已解包：{ url, fileName }
+      // 2) 标准包装：{ code, msg, data: { url, fileName } }
+      // 3) axios原始响应：{ data: { code, msg, data: { url } } }
+      const rawUpload = uploadResp?.data || uploadResp;
+      const uploadCode = rawUpload?.code;
+      const uploadMsg = rawUpload?.msg || rawUpload?.data?.msg;
+      const uploadPayload = rawUpload?.data?.url
+        ? rawUpload.data
+        : (rawUpload?.data?.data || rawUpload);
+      const uploadUrl = uploadPayload?.url;
+
+      if ((typeof uploadCode !== 'undefined' && uploadCode !== 0) || !uploadUrl) {
+        console.error('视频文件上传响应异常:', uploadResp);
+        throw new Error(uploadMsg || '视频文件上传失败');
+      }
+      uploadedVideoInputSource = uploadUrl;
+    }
+
     // 根据输入源类型添加文件或URL
     if (state.activeSource === 'image' && state.uploadedImageFile) {
       formData.append('file', state.uploadedImageFile);
@@ -709,7 +735,8 @@ const startDetection = async () => {
       // 从历史记录还原的图片，使用 input_source URL
       formData.append('input_source', state.historyInputSource);
     } else if (state.activeSource === 'video' && state.uploadedVideoFile) {
-      formData.append('file', state.uploadedVideoFile);
+      // 视频走上传接口后，这里只传URL，避免run接口请求过大
+      formData.append('input_source', uploadedVideoInputSource || '');
     } else if (state.activeSource === 'video' && state.historyInputSource) {
       // 从历史记录还原的视频，使用 input_source URL
       formData.append('input_source', state.historyInputSource);
@@ -970,7 +997,10 @@ const startDetection = async () => {
     
     createMessage.error(errorMessage);
   } finally {
-    state.inferenceLoading = false;
+    // 视频推理提交后会进入轮询阶段，此时不要在finally里提前关闭loading
+    if (state.currentInferenceRecordId === null) {
+      state.inferenceLoading = false;
+    }
   }
 };
 
@@ -1393,7 +1423,7 @@ const startPollingInferenceResult = (recordId: number) => {
     // 检查超时
     if (state.pollingStartTime && Date.now() - state.pollingStartTime > POLLING_TIMEOUT) {
       stopPollingInferenceResult();
-      createMessage.warning('推理任务超时，请刷新页面重试');
+      createMessage.warning('推理任务处理时间较长，已停止自动轮询，请到历史记录查看最新状态');
       state.inferenceLoading = false;
       state.statusText = '推理超时';
       return;

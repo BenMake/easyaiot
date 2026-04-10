@@ -48,6 +48,7 @@ RUN set -ex && \
         x11-apps \
         libgl1-mesa-glx \
         libxcb-xinerama0 \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

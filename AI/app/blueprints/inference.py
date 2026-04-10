@@ -529,17 +529,23 @@ def run_inference(model_id):
             })
         finally:
             # 清理临时文件
-            if temp_file_path and os.path.exists(temp_file_path):
+            # 注意：视频推理是异步子进程执行，若此处提前删除 temp_file_path，
+            # 子进程会报“视频文件不存在”。该文件由子进程处理完成后自行清理。
+            defer_async_video_cleanup = inference_type == 'video' and temp_file_path is not None
+
+            if not defer_async_video_cleanup and temp_file_path and os.path.exists(temp_file_path):
                 try:
                     os.unlink(temp_file_path)
                 except Exception as e:
                     logger.warning(f"删除临时文件失败: {temp_file_path}, {str(e)}")
-            if temp_dir and os.path.exists(temp_dir):
+
+            if not defer_async_video_cleanup and temp_dir and os.path.exists(temp_dir):
                 try:
                     import shutil
                     shutil.rmtree(temp_dir)
                 except Exception as e:
                     logger.warning(f"删除临时目录失败: {temp_dir}, {str(e)}")
+
             # 清理上传文件的临时文件（如果使用了临时文件）
             if uploaded_file_path and os.path.exists(uploaded_file_path):
                 try:

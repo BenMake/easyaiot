@@ -154,7 +154,7 @@ def label_single_image(dataset_id, image_id):
         import requests
         java_backend_url = os.getenv('JAVA_BACKEND_URL', 'http://localhost:8080')
         image_response = requests.get(
-            f"{java_backend_url}/dataset/image/get",
+            f"{java_backend_url}/admin-api/dataset/image/get",
             params={'id': image_id},
             timeout=10
         )
@@ -204,7 +204,7 @@ def label_single_image(dataset_id, image_id):
 
             # 更新Java后端的图片标注信息
             update_response = requests.put(
-                f"{java_backend_url}/dataset/image/update",
+                f"{java_backend_url}/admin-api/dataset/image/update",
                 json={
                     'id': image_id,
                     'datasetId': dataset_id,
@@ -267,7 +267,7 @@ def export_labeled_dataset(dataset_id):
 
         # 从Java后端获取图片列表
         response = requests.get(
-            f"{java_backend_url}/dataset/image/page",
+            f"{java_backend_url}/admin-api/dataset/image/page",
             params={'dataset_id': dataset_id, 'page_size': 10000},
             timeout=30
         )
@@ -521,7 +521,7 @@ def execute_auto_label_task(app, task_id):
             logger.info(f"开始获取数据集图片列表: dataset_id={task.dataset_id}")
 
             response = requests.get(
-                f"{java_backend_url}/dataset/image/page",
+                f"{java_backend_url}/admin-api/dataset/image/page",
                 params={'datasetId': task.dataset_id, 'pageSize': 100},  # 使用驼峰命名
                 timeout=30
             )
@@ -611,7 +611,7 @@ def execute_auto_label_task(app, task_id):
 
                     # 更新Java后端的图片标注信息
                     update_response = requests.put(
-                        f"{java_backend_url}/dataset/image/update",
+                        f"{java_backend_url}/admin-api/dataset/image/update",
                         json={
                             'id': image_id,
                             'datasetId': task.dataset_id,
