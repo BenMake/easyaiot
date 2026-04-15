@@ -431,6 +431,116 @@ services:
     networks:
       - easyaiot-network
 
+  # Apache Flink Session 集群（JobManager + TaskManager）
+  # Web UI: http://localhost:8081
+  FlinkJobManager:
+    image: flink:1.20.3-scala_2.12-java11
+    container_name: flink-jobmanager
+    restart: always
+    ports:
+      - "8081:8081"
+      - "6123:6123"
+    command: jobmanager
+    environment:
+      TZ: Asia/Shanghai
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: FlinkJobManager
+    volumes:
+      - "./flink_data/jm:/opt/flink/data:rw"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    networks:
+      - easyaiot-network
+
+  FlinkTaskManager:
+    image: flink:1.20.3-scala_2.12-java11
+    container_name: flink-taskmanager
+    restart: always
+    depends_on:
+      FlinkJobManager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      TZ: Asia/Shanghai
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: FlinkJobManager
+        taskmanager.numberOfTaskSlots: 4
+    volumes:
+      - "./flink_data/tm:/opt/flink/data:rw"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://FlinkJobManager:8081/taskmanagers >/dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    networks:
+      - easyaiot-network
+
+  # Apache Doris（单 FE + 单 BE，hostname 与 FE_SERVERS/BE_ADDR 对应）
+  # FE Web: http://localhost:8030  MySQL 协议端口: 9030
+  DorisFE:
+    image: apache/doris:2.0.15-fe-x86_64
+    container_name: doris-fe-server
+    hostname: fe
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      FE_SERVERS: "fe1:fe:9010"
+      FE_ID: "1"
+    ports:
+      - "8030:8030"
+      - "9030:9030"
+      - "9010:9010"
+    volumes:
+      - "./doris_data/fe_meta:/opt/apache-doris/fe/doris-meta:rw"
+      - "./doris_data/fe_log:/opt/apache-doris/fe/log:rw"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -sf http://localhost:8030/api/bootstrap >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    networks:
+      - easyaiot-network
+
+  DorisBE:
+    image: apache/doris:2.0.15-be-x86_64
+    container_name: doris-be-server
+    hostname: be
+    restart: always
+    privileged: true
+    depends_on:
+      DorisFE:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      FE_SERVERS: "fe1:fe:9010"
+      BE_ADDR: "be:9050"
+    ports:
+      - "8040:8040"
+      - "9060:9060"
+    volumes:
+      - "./doris_data/be_storage:/opt/apache-doris/be/storage:rw"
+      - "./doris_data/be_log:/opt/apache-doris/be/log:rw"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -sf http://localhost:8040/api/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - easyaiot-network
+
 # 磁盘挂载
 volumes:
   nacos_data:

@@ -60,6 +60,10 @@ MIDDLEWARE_SERVICES=(
     "NodeRED"
     "EMQX"
     "ZLMediaKit"
+    "FlinkJobManager"
+    "FlinkTaskManager"
+    "DorisFE"
+    "DorisBE"
 )
 
 # 中间件端口映射
@@ -75,6 +79,10 @@ MIDDLEWARE_PORTS["SRS"]="1935"
 MIDDLEWARE_PORTS["NodeRED"]="1880"
 MIDDLEWARE_PORTS["EMQX"]="1883"
 MIDDLEWARE_PORTS["ZLMediaKit"]="6080"
+MIDDLEWARE_PORTS["FlinkJobManager"]="8081"
+MIDDLEWARE_PORTS["FlinkTaskManager"]=""
+MIDDLEWARE_PORTS["DorisFE"]="8030"
+MIDDLEWARE_PORTS["DorisBE"]="8040"
 
 # 中间件健康检查端点
 declare -A MIDDLEWARE_HEALTH_ENDPOINTS
@@ -89,6 +97,10 @@ MIDDLEWARE_HEALTH_ENDPOINTS["SRS"]="/api/v1/versions"
 MIDDLEWARE_HEALTH_ENDPOINTS["NodeRED"]="/"
 MIDDLEWARE_HEALTH_ENDPOINTS["EMQX"]="/api/v5/status"
 MIDDLEWARE_HEALTH_ENDPOINTS["ZLMediaKit"]="/index/api/getServerConfig"
+MIDDLEWARE_HEALTH_ENDPOINTS["FlinkJobManager"]="/"
+MIDDLEWARE_HEALTH_ENDPOINTS["FlinkTaskManager"]=""
+MIDDLEWARE_HEALTH_ENDPOINTS["DorisFE"]="/api/bootstrap"
+MIDDLEWARE_HEALTH_ENDPOINTS["DorisBE"]="/api/health"
 
 # 日志输出函数（去掉颜色代码后写入日志文件）
 log_to_file() {
@@ -1923,6 +1935,12 @@ create_all_storage_directories() {
         "${SCRIPT_DIR}/../zlmediakit/www:::"         # ZLMediaKit Web 目录（使用默认权限）
         "${SCRIPT_DIR}/../zlmediakit/log:::"         # ZLMediaKit 日志（使用默认权限）
         "${SCRIPT_DIR}/../zlmediakit/conf:::"        # ZLMediaKit 配置（使用默认权限）
+        "${SCRIPT_DIR}/flink_data/jm:::"             # Flink JobManager 数据
+        "${SCRIPT_DIR}/flink_data/tm:::"             # Flink TaskManager 数据
+        "${SCRIPT_DIR}/doris_data/fe_meta:::"       # Doris FE 元数据
+        "${SCRIPT_DIR}/doris_data/fe_log:::"         # Doris FE 日志
+        "${SCRIPT_DIR}/doris_data/be_storage:::"     # Doris BE 存储
+        "${SCRIPT_DIR}/doris_data/be_log:::"         # Doris BE 日志
     )
     
     local created_count=0
@@ -2012,6 +2030,8 @@ create_all_storage_directories() {
         "${SCRIPT_DIR}/milvus_data"
         "${SCRIPT_DIR}/srs_data"
         "${SCRIPT_DIR}/nodered_data"
+        "${SCRIPT_DIR}/flink_data"
+        "${SCRIPT_DIR}/doris_data"
         "${SCRIPT_DIR}/../zlmediakit"
         "${SCRIPT_DIR}/logs"
     )
@@ -4054,6 +4074,21 @@ extract_ports_from_compose() {
             "ZLMediaKit")
                 ports=("6080" "4443" "10935" "5540" "10000" "8000" "9000")
                 ;;
+            "Milvus")
+                ports=("19530" "9091")
+                ;;
+            "FlinkJobManager")
+                ports=("8081" "6123")
+                ;;
+            "FlinkTaskManager")
+                ports=()
+                ;;
+            "DorisFE")
+                ports=("8030" "9030" "9010")
+                ;;
+            "DorisBE")
+                ports=("8040" "9060")
+                ;;
         esac
     fi
     
@@ -4087,6 +4122,11 @@ check_and_clean_ports() {
             "NodeRED") container_name="nodered-server" ;;
             "EMQX") container_name="emqx-server" ;;
             "ZLMediaKit") container_name="zlmediakit-server" ;;
+            "Milvus") container_name="milvus-server" ;;
+            "FlinkJobManager") container_name="flink-jobmanager" ;;
+            "FlinkTaskManager") container_name="flink-taskmanager" ;;
+            "DorisFE") container_name="doris-fe-server" ;;
+            "DorisBE") container_name="doris-be-server" ;;
         esac
         
         if [ -n "$container_name" ]; then
@@ -4673,6 +4713,11 @@ check_and_clean_ports() {
                                     "NodeRED") container_name="nodered-server" ;;
                                     "EMQX") container_name="emqx-server" ;;
                                     "ZLMediaKit") container_name="zlmediakit-server" ;;
+                                    "Milvus") container_name="milvus-server" ;;
+                                    "FlinkJobManager") container_name="flink-jobmanager" ;;
+                                    "FlinkTaskManager") container_name="flink-taskmanager" ;;
+                                    "DorisFE") container_name="doris-fe-server" ;;
+                                    "DorisBE") container_name="doris-be-server" ;;
                                 esac
                                 
                                 if [ -n "$container_name" ]; then
@@ -4794,12 +4839,16 @@ cleanup_stale_containers() {
                 "NodeRED") container_names+=("nodered-server") ;;
                 "EMQX") container_names+=("emqx-server") ;;
                 "ZLMediaKit") container_names+=("zlmediakit-server") ;;
+                "FlinkJobManager") container_names+=("flink-jobmanager") ;;
+                "FlinkTaskManager") container_names+=("flink-taskmanager") ;;
+                "DorisFE") container_names+=("doris-fe-server") ;;
+                "DorisBE") container_names+=("doris-be-server") ;;
             esac
         fi
     done
     
     # 检查是否有停止的容器需要清理
-    local stale_containers=$(docker ps -a --filter "status=exited" --format "{{.Names}}" 2>/dev/null | grep -E "(nacos-server|postgres-server|tdengine-server|redis-server|kafka-server|minio-server|milvus-server|srs-server|nodered-server|emqx-server|zlmediakit-server)" || echo "")
+    local stale_containers=$(docker ps -a --filter "status=exited" --format "{{.Names}}" 2>/dev/null | grep -E "(nacos-server|postgres-server|tdengine-server|redis-server|kafka-server|minio-server|milvus-server|srs-server|nodered-server|emqx-server|zlmediakit-server|flink-jobmanager|flink-taskmanager|doris-fe-server|doris-be-server)" || echo "")
     
     if [ -n "$stale_containers" ]; then
         print_info "发现残留的停止容器，正在清理..."
@@ -4889,6 +4938,11 @@ install_middleware() {
             "NodeRED") container_name="nodered-server" ;;
             "EMQX") container_name="emqx-server" ;;
             "ZLMediaKit") container_name="zlmediakit-server" ;;
+            "Milvus") container_name="milvus-server" ;;
+            "FlinkJobManager") container_name="flink-jobmanager" ;;
+            "FlinkTaskManager") container_name="flink-taskmanager" ;;
+            "DorisFE") container_name="doris-fe-server" ;;
+            "DorisBE") container_name="doris-be-server" ;;
         esac
         
         if [ -n "$container_name" ]; then
@@ -4910,6 +4964,10 @@ install_middleware() {
             case "$service" in
                 "TDengine") print_info "  docker logs tdengine-server" ;;
                 "Redis") print_info "  docker logs redis-server" ;;
+                "FlinkJobManager") print_info "  docker logs flink-jobmanager" ;;
+                "FlinkTaskManager") print_info "  docker logs flink-taskmanager" ;;
+                "DorisFE") print_info "  docker logs doris-fe-server" ;;
+                "DorisBE") print_info "  docker logs doris-be-server" ;;
                 *) print_info "  docker-compose logs $service" ;;
             esac
         done
@@ -5233,6 +5291,8 @@ clean_middleware() {
             "mq_data"                   # Kafka 数据
             "minio_data"                # MinIO 数据和配置
             "milvus_data"               # Milvus 数据
+            "flink_data"                # Flink JobManager / TaskManager 数据
+            "doris_data"                # Doris FE / BE 数据与日志
             "srs_data"                  # SRS 配置、数据和回放
             "nodered_data"              # NodeRED 数据
         )
