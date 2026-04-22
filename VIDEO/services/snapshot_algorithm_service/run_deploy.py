@@ -161,6 +161,8 @@ PUSH_QUEUE_SIZE = int(os.getenv('PUSH_QUEUE_SIZE', '100'))  # 推帧队列大小
 EXTRACT_QUEUE_SIZE = int(os.getenv('EXTRACT_QUEUE_SIZE', '1'))  # 抽帧队列大小（默认1，每个摄像头只保留1帧）
 # 检测工作线程数量（优化以提升处理能力）
 YOLO_WORKER_THREADS = int(os.getenv('YOLO_WORKER_THREADS', '2'))  # YOLO检测线程数（默认2，原1）
+# 抓拍结果最大等待时长（秒）：超过该时长仍未返回检测结果则丢弃，避免延迟累积
+SNAPSHOT_RESULT_MAX_WAIT_SEC = float(os.getenv('SNAPSHOT_RESULT_MAX_WAIT_SEC', '5.0'))
 
 FACE_CLASS_KEYWORDS = ('face', 'facial', 'person_face', '人脸')
 PLATE_CLASS_KEYWORDS = ('plate', 'license_plate', 'licence_plate', 'car_plate', '车牌')
@@ -1337,8 +1339,116 @@ def buffer_streamer_worker(device_id: str):
     # 流畅度优化：基于时间戳的帧率控制
     frame_interval = 1.0 / SOURCE_FPS
     last_frame_time = time.time()
-    last_processed_frame = None
-    last_processed_detections = []
+    max_push_process_per_cycle = 20
+
+    def process_detection_results_and_cleanup():
+        """异步消费检测结果并清理超时帧，避免检测慢导致延迟累积。"""
+        processed_count = 0
+        while processed_count < max_push_process_per_cycle:
+            try:
+                push_data = push_queues[device_id].get_nowait()
+                processed_frame = push_data['frame']
+                fn = push_data['frame_number']
+                detections = push_data.get('detections', [])
+
+                frame_data = None
+                with buffer_locks[device_id]:
+                    frame_buffer = frame_buffers[device_id]
+                    if fn in frame_buffer:
+                        frame_buffer[fn]['frame'] = processed_frame
+                        frame_buffer[fn]['processed'] = True
+                        frame_buffer[fn]['detections'] = detections
+                        frame_data = frame_buffer[fn]
+                    pending_frames.discard(fn)
+
+                # 帧可能已超时清理，直接跳过
+                if not frame_data:
+                    processed_count += 1
+                    continue
+
+                output_frame = frame_data['frame']
+                frame_timestamp = frame_data.get('timestamp', time.time())
+
+                # 只在抽帧的帧上发送告警
+                if detections and task_config and task_config.alert_event_enabled:
+                    logger.info(f"🚨 设备 {device_id} 抽帧帧 {fn} 开始发送告警：检测到 {len(detections)} 个目标")
+                    # 发送告警（每个检测结果发送一次）
+                    for det in detections:
+                        try:
+                            # 保存告警图片到本地
+                            image_path = save_alert_image(
+                                output_frame,
+                                device_id,
+                                fn,
+                                det
+                            )
+
+                            # 构建告警数据（参照告警表字段）
+                            # 获取算法名称（任务名称）
+                            algorithm_name = task_config.task_name if task_config and hasattr(
+                                task_config, 'task_name') else 'detection'
+
+                            alert_data = {
+                                'object': det.get('class_name', 'unknown'),
+                                'event': algorithm_name,  # 使用算法名称作为事件类型
+                                'device_id': device_id,
+                                'device_name': device_name,
+                                'face_detection_enabled': bool(
+                                    getattr(task_config, 'face_detection_enabled', False)
+                                ),
+                                'plate_detection_enabled': bool(
+                                    getattr(task_config, 'plate_detection_enabled', False)
+                                ),
+                                'time': datetime.fromtimestamp(frame_timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                                'information': json.dumps({
+                                    'track_id': det.get('track_id', 0),
+                                    'confidence': det.get('confidence', 0),
+                                    'bbox': det.get('bbox', []),
+                                    'frame_number': fn,
+                                    'first_seen_time': datetime.fromtimestamp(
+                                        det.get('first_seen_time', frame_timestamp)
+                                    ).isoformat() if det.get('first_seen_time') else None,
+                                    'duration': det.get('duration', 0)
+                                }),
+                                # 不直接传输图片，而是传输图片所在磁盘路径
+                                'image_path': image_path if image_path else None,
+                            }
+
+                            # 异步发送告警事件
+                            logger.info(
+                                f"📤 设备 {device_id} 抽帧帧 {fn} 异步发送告警事件: object={alert_data['object']}, event={alert_data['event']}")
+                            send_alert_event_async(alert_data)
+                        except Exception as e:
+                            logger.error(f"发送告警失败: {str(e)}", exc_info=True)
+
+                # 告警发送（或无告警）后清理该帧
+                with buffer_locks[device_id]:
+                    frame_buffer = frame_buffers[device_id]
+                    frame_buffer.pop(fn, None)
+                logger.info(f"✅ 设备 {device_id} 抽帧帧 {fn} 处理完成，已清理")
+                processed_count += 1
+            except queue.Empty:
+                break
+
+        # 超时清理：异步模式下定期回收过期未完成帧，防止延迟累积
+        now_ts = time.time()
+        timed_out_frames = []
+        with buffer_locks[device_id]:
+            frame_buffer = frame_buffers[device_id]
+            for fn, frame_data in list(frame_buffer.items()):
+                frame_ts = frame_data.get('timestamp', now_ts)
+                if now_ts - frame_ts > SNAPSHOT_RESULT_MAX_WAIT_SEC:
+                    timed_out_frames.append(fn)
+
+            for fn in timed_out_frames:
+                frame_buffer.pop(fn, None)
+                pending_frames.discard(fn)
+
+        if timed_out_frames:
+            logger.warning(
+                f"⚠️  设备 {device_id} 超时清理抓拍帧 {len(timed_out_frames)} 个: {timed_out_frames[:5]}"
+                f"{'...' if len(timed_out_frames) > 5 else ''}"
+            )
 
     while not stop_event.is_set():
         try:
@@ -1438,7 +1548,8 @@ def buffer_streamer_worker(device_id: str):
 
             # 检查cron表达式，如果不在cron时间点，直接跳过这帧
             if not should_extract_frame_by_cron(device_id, current_timestamp):
-                # 不在cron时间点，跳过这帧，不处理
+                # 不在cron时间点也要消费检测结果，避免结果堆积到下一次cron才处理
+                process_detection_results_and_cleanup()
                 continue
 
             # 到了cron时间点，处理这1帧
@@ -1457,7 +1568,7 @@ def buffer_streamer_worker(device_id: str):
             try:
                 # 尝试直接放入
                 extract_queues[device_id].put_nowait({
-                    'frame': frame.copy(),
+                    'frame': frame,
                     'frame_number': frame_count,
                     'timestamp': current_timestamp,
                     'device_id': device_id
@@ -1476,7 +1587,7 @@ def buffer_streamer_worker(device_id: str):
                 # 再次尝试放入新帧
                 try:
                     extract_queues[device_id].put_nowait({
-                        'frame': frame.copy(),
+                        'frame': frame,
                         'frame_number': frame_count,
                         'timestamp': current_timestamp,
                         'device_id': device_id
@@ -1491,108 +1602,17 @@ def buffer_streamer_worker(device_id: str):
             with buffer_locks[device_id]:
                 frame_buffer = frame_buffers[device_id]
                 frame_buffer[frame_count] = {
-                    'frame': frame.copy(),
+                    'frame': frame,
                     'frame_number': frame_count,
                     'timestamp': current_timestamp,
                     'processed': False,
                     'is_extracted': True  # 标记为抽帧的帧
                 }
 
-            # 等待检测结果（最多等待5秒）
-            wait_start = time.time()
-            max_wait_time = 5.0
-            while frame_count in pending_frames and (time.time() - wait_start) < max_wait_time:
-                # 检查推帧队列，获取检测结果
-                try:
-                    push_data = push_queues[device_id].get_nowait()
-                    processed_frame = push_data['frame']
-                    fn = push_data['frame_number']
-                    detections = push_data.get('detections', [])
+            # 低延迟模式：抽帧后不阻塞等待检测结果，继续读取最新流帧。
+            # 检测结果在下方异步消费并发送告警，避免单帧慢检测拖慢整体。
 
-                    with buffer_locks[device_id]:
-                        frame_buffer = frame_buffers[device_id]
-                        if fn in frame_buffer:
-                            frame_buffer[fn]['frame'] = processed_frame
-                            frame_buffer[fn]['processed'] = True
-                            frame_buffer[fn]['detections'] = detections
-                            pending_frames.discard(fn)
-
-                            # 如果是当前抽帧的帧，发送告警
-                            if fn == frame_count:
-                                frame_data = frame_buffer[fn]
-                                output_frame = frame_data['frame']
-                                current_timestamp = frame_data.get('timestamp', time.time())
-
-                                # 只在抽帧的帧上发送告警
-                                if detections and task_config and task_config.alert_event_enabled:
-                                    logger.info(
-                                        f"🚨 设备 {device_id} 抽帧帧 {frame_count} 开始发送告警：检测到 {len(detections)} 个目标")
-                                    # 发送告警（每个检测结果发送一次）
-                                    for det in detections:
-                                        try:
-                                            # 保存告警图片到本地
-                                            image_path = save_alert_image(
-                                                output_frame,
-                                                device_id,
-                                                frame_count,
-                                                det
-                                            )
-
-                                            # 构建告警数据（参照告警表字段）
-                                            # 获取算法名称（任务名称）
-                                            algorithm_name = task_config.task_name if task_config and hasattr(
-                                                task_config, 'task_name') else 'detection'
-
-                                            alert_data = {
-                                                'object': det.get('class_name', 'unknown'),
-                                                'event': algorithm_name,  # 使用算法名称作为事件类型
-                                                'device_id': device_id,
-                                                'device_name': device_name,
-                                                'face_detection_enabled': bool(
-                                                    getattr(task_config, 'face_detection_enabled', False)
-                                                ),
-                                                'plate_detection_enabled': bool(
-                                                    getattr(task_config, 'plate_detection_enabled', False)
-                                                ),
-                                                'time': datetime.fromtimestamp(current_timestamp).strftime(
-                                                    '%Y-%m-%d %H:%M:%S'),
-                                                'information': json.dumps({
-                                                    'track_id': det.get('track_id', 0),
-                                                    'confidence': det.get('confidence', 0),
-                                                    'bbox': det.get('bbox', []),
-                                                    'frame_number': frame_count,
-                                                    'first_seen_time': datetime.fromtimestamp(det.get('first_seen_time',
-                                                                                                      current_timestamp)).isoformat() if det.get(
-                                                        'first_seen_time') else None,
-                                                    'duration': det.get('duration', 0)
-                                                }),
-                                                # 不直接传输图片，而是传输图片所在磁盘路径
-                                                'image_path': image_path if image_path else None,
-                                            }
-
-                                            # 异步发送告警事件
-                                            logger.info(
-                                                f"📤 设备 {device_id} 抽帧帧 {frame_count} 异步发送告警事件: object={alert_data['object']}, event={alert_data['event']}")
-                                            send_alert_event_async(alert_data)
-                                        except Exception as e:
-                                            logger.error(f"发送告警失败: {str(e)}", exc_info=True)
-
-                                # 告警发送完成后，清理该帧
-                                frame_buffer.pop(frame_count, None)
-                                logger.info(f"✅ 设备 {device_id} 抽帧帧 {frame_count} 处理完成，已清理")
-                                break  # 处理完成，退出等待循环
-                except queue.Empty:
-                    # 没有检测结果，继续等待
-                    time.sleep(0.1)  # 100ms
-
-            # 如果超时仍未处理完成，清理该帧
-            if frame_count in pending_frames:
-                with buffer_locks[device_id]:
-                    frame_buffer = frame_buffers[device_id]
-                    if frame_count in frame_buffer:
-                        frame_buffer.pop(frame_count, None)
-                    pending_frames.discard(frame_count)
-                logger.warning(f"⚠️  设备 {device_id} 抽帧帧 {frame_count} 处理超时，已清理")
+            process_detection_results_and_cleanup()
 
             # 优化CPU占用：短暂休眠，避免频繁读取帧
             time.sleep(0.1)  # 100ms
@@ -1638,7 +1658,7 @@ def extractor_worker():
                             try:
                                 detection_queue.put_nowait({
                                     'frame_id': frame_id,
-                                    'frame': frame.copy(),
+                                    'frame': frame,
                                     'frame_number': frame_number,
                                     'timestamp': timestamp,
                                     'device_id': device_id_from_data
@@ -1867,7 +1887,7 @@ def yolo_detection_worker(worker_id: int):
                             logger.info(
                                 f"🎨 [Worker {worker_id}] 帧 {frame_number} 绘制了 {len(tracked_detections)} 个检测框")
                     else:
-                        processed_frame = frame.copy()
+                        processed_frame = frame
 
                     # 构建检测结果列表（用于后续处理）
                     detections = []

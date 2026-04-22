@@ -197,6 +197,12 @@ PUSH_QUEUE_SIZE = int(os.getenv('PUSH_QUEUE_SIZE', '100'))  # 推帧队列大小
 EXTRACT_QUEUE_SIZE = int(os.getenv('EXTRACT_QUEUE_SIZE', '50'))  # 抽帧队列大小（默认50）
 # 检测工作线程数量（优化以提升处理能力）
 YOLO_WORKER_THREADS = int(os.getenv('YOLO_WORKER_THREADS', '2'))  # YOLO检测线程数（默认2，原1）
+# 插值框复用阈值：限制旧检测结果复用时长，避免低延迟模式下出现拖影
+INTERPOLATED_DETECTION_MAX_AGE_MS = int(os.getenv('INTERPOLATED_DETECTION_MAX_AGE_MS', '200'))
+INTERPOLATED_DETECTION_MAX_AGE_SEC = max(0.0, INTERPOLATED_DETECTION_MAX_AGE_MS / 1000.0)
+INTERPOLATED_DETECTION_MAX_FRAME_GAP = int(
+    os.getenv('INTERPOLATED_DETECTION_MAX_FRAME_GAP', str(max(2, SOURCE_FPS)))
+)
 
 FACE_CLASS_KEYWORDS = ('face', 'facial', 'person_face', '人脸')
 PLATE_CLASS_KEYWORDS = ('plate', 'license_plate', 'licence_plate', 'car_plate', '车牌')
@@ -1420,6 +1426,8 @@ def buffer_streamer_worker(device_id: str):
     last_frame_time = time.time()
     last_processed_frame = None
     last_processed_detections = []
+    last_processed_detection_timestamp = 0.0
+    last_processed_detection_frame_number = 0
 
     while not stop_event.is_set():
         try:
@@ -1708,6 +1716,7 @@ def buffer_streamer_worker(device_id: str):
                     # 获取设备实际使用的编码器（如果设备有失败记录，使用软件编码；否则使用全局配置）
                     with device_codec_locks[device_id]:
                         device_codec = device_codec_status.get(device_id, _hwaccel_codec)
+                    gop_size_for_low_latency = SOURCE_FPS
                     
                     # 根据编码器类型构建FFmpeg命令
                     if device_codec == 'h264_nvenc':
@@ -1718,8 +1727,9 @@ def buffer_streamer_worker(device_id: str):
                             "-pix_fmt", "yuv420p",
                             "-preset", "p4",  # NVENC预设：p1(最快)到p7(最慢)，p4为平衡
                             "-tune", "ll",  # 低延迟调优
+                            "-zerolatency", "1",
                             "-gpu", "0",  # 使用第一个GPU
-                            "-g", str(FFMPEG_GOP_SIZE),
+                            "-g", str(gop_size_for_low_latency),
                             "-rc", "cbr",  # 恒定比特率模式
                             "-rc-lookahead", "0",  # 禁用lookahead以降低延迟
                             "-surfaces", "1",  # 最小表面数，降低延迟
@@ -1733,7 +1743,8 @@ def buffer_streamer_worker(device_id: str):
                             "-b:v", FFMPEG_VIDEO_BITRATE,  # 使用配置的比特率（默认500k）
                             "-pix_fmt", "yuv420p",
                             "-preset", FFMPEG_PRESET,  # 使用配置的预设（默认ultrafast）
-                            "-g", str(FFMPEG_GOP_SIZE),  # GOP 大小：2秒一个关键帧
+                            "-tune", "zerolatency",
+                            "-g", str(gop_size_for_low_latency),  # GOP 大小：1秒一个关键帧
                             "-keyint_min", str(SOURCE_FPS),  # 最小关键帧间隔：1秒
                             "-f", "flv",
                         ])
@@ -1756,7 +1767,7 @@ def buffer_streamer_worker(device_id: str):
                     logger.info(f"🚀 启动设备 {device_id} 推送进程（优化模式：低CPU占用）")
                     logger.info(f"   📺 推流地址: {rtmp_url}")
                     logger.info(f"   📐 尺寸: {width}x{height}, 帧率: {SOURCE_FPS}fps")
-                    logger.info(f"   🎬 编码器: {codec_info}, 比特率: {FFMPEG_VIDEO_BITRATE}, GOP: {FFMPEG_GOP_SIZE}")
+                    logger.info(f"   🎬 编码器: {codec_info}, 比特率: {FFMPEG_VIDEO_BITRATE}, GOP: {gop_size_for_low_latency}")
                     if device_codec != 'h264_nvenc' and FFMPEG_THREADS is not None and str(FFMPEG_THREADS).strip():
                         logger.info(f"   🧵 编码线程数: {FFMPEG_THREADS}")
                     logger.debug(f"   FFmpeg命令: {' '.join(ffmpeg_cmd)}")
@@ -2048,113 +2059,8 @@ def buffer_streamer_worker(device_id: str):
                     output_frame = frame_data['frame']
                     is_processed = frame_data.get('processed', False)
                     current_timestamp = frame_data.get('timestamp', time.time())
-                    is_extracted = (next_output_frame % EXTRACT_INTERVAL == 0)
-
-                # 如果该帧需要抽帧但还未处理完成，等待处理完成（在锁外等待）
-                if is_extracted and next_output_frame in pending_frames:
-                    # 等待处理完成，优化CPU占用
-                    wait_start = time.time()
-                    check_interval = 0.02  # 每20ms检查一次，进一步减少CPU轮询频率
-
-                    while next_output_frame in pending_frames and (time.time() - wait_start) < MAX_WAIT_TIME:
-                        time.sleep(check_interval)
-                        # 持续检查推帧队列，处理所有到达的帧（关键：确保不遗漏）
-                        processed_in_wait = 0
-                        while processed_in_wait < 20:  # 增加处理数量
-                            try:
-                                push_data = push_queues[device_id].get(timeout=0.05)
-                                processed_frame = push_data['frame']
-                                fn = push_data['frame_number']
-                                detections = push_data.get('detections', [])
-                                with buffer_locks[device_id]:
-                                    frame_buffer = frame_buffers[device_id]
-                                    if fn in frame_buffer:
-                                        frame_buffer[fn]['frame'] = processed_frame
-                                        frame_buffer[fn]['processed'] = True
-                                        frame_buffer[fn]['detections'] = detections
-                                        pending_frames.discard(fn)
-
-                                        # 如果目标帧已处理完成，立即退出
-                                        if fn == next_output_frame:
-                                            # 更新帧数据
-                                            frame_data = frame_buffer[next_output_frame]
-                                            output_frame = frame_data['frame']
-                                            is_processed = True
-                                            break
-                                processed_in_wait += 1
-                            except queue.Empty:
-                                break
-
-                        # 如果目标帧已处理完成，退出等待循环
-                        if next_output_frame not in pending_frames:
-                            # 重新获取帧数据（可能已更新）
-                            with buffer_locks[device_id]:
-                                if next_output_frame in frame_buffers[device_id]:
-                                    frame_data = frame_buffers[device_id][next_output_frame]
-                                    output_frame = frame_data['frame']
-                                    is_processed = frame_data.get('processed', False)
-                            break
-
-                    # 如果超时仍未处理完成，再等待一小段时间，尽量等待处理完成
-                    if next_output_frame in pending_frames:
-                        # 再给一次机会，等待额外的时间（优化CPU占用）
-                        extra_wait_start = time.time()
-                        extra_wait_time = 0.05
-                        while next_output_frame in pending_frames and (
-                                time.time() - extra_wait_start) < extra_wait_time:
-                            time.sleep(0.02)  # 增加sleep时间，减少轮询频率
-                            # 再次检查推帧队列
-                            try:
-                                push_data = push_queues[device_id].get(timeout=0.05)
-                                processed_frame = push_data['frame']
-                                fn = push_data['frame_number']
-                                detections = push_data.get('detections', [])
-                                with buffer_locks[device_id]:
-                                    frame_buffer = frame_buffers[device_id]
-                                    if fn in frame_buffer:
-                                        frame_buffer[fn]['frame'] = processed_frame
-                                        frame_buffer[fn]['processed'] = True
-                                        frame_buffer[fn]['detections'] = detections
-                                        pending_frames.discard(fn)
-                                        if fn == next_output_frame:
-                                            frame_data = frame_buffer[next_output_frame]
-                                            output_frame = frame_data['frame']
-                                            is_processed = True
-                                            break
-                            except queue.Empty:
-                                pass
-
-                # 在输出前，最后检查一次推帧队列，确保不遗漏已处理的帧
-                last_check_count = 0
-                while last_check_count < 5:  # 快速检查几次
-                    try:
-                        push_data = push_queues[device_id].get(timeout=0.05)
-                        processed_frame = push_data['frame']
-                        fn = push_data['frame_number']
-                        detections = push_data.get('detections', [])
-                        with buffer_locks[device_id]:
-                            frame_buffer = frame_buffers[device_id]
-                            if fn in frame_buffer:
-                                frame_buffer[fn]['frame'] = processed_frame
-                                frame_buffer[fn]['processed'] = True
-                                frame_buffer[fn]['detections'] = detections
-                                pending_frames.discard(fn)
-                                # 如果正好是目标帧，更新输出帧
-                                if fn == next_output_frame:
-                                    frame_data = frame_buffer[next_output_frame]
-                                    output_frame = frame_data['frame']
-                                    is_processed = True
-                        last_check_count += 1
-                    except queue.Empty:
-                        break
-
-                # 重新获取帧数据（可能已更新）
-                with buffer_locks[device_id]:
-                    if next_output_frame in frame_buffers[device_id]:
-                        frame_data = frame_buffers[device_id][next_output_frame]
-                        output_frame = frame_data['frame']
-                        is_processed = frame_data.get('processed', False)
-                        current_timestamp = frame_data.get('timestamp', time.time())
+                # 低延迟模式：不再等待抽帧检测结果，始终按顺序即时输出当前帧。
+                # 若当前帧尚未完成检测，后续使用追踪缓存框/最近一次检测结果补绘。
 
                 # 如果帧未处理完成，尝试使用追踪器缓存框或最近一次检测结果
                 if not is_processed:
@@ -2178,7 +2084,18 @@ def buffer_streamer_worker(device_id: str):
                                         f"✅ 设备 {device_id} 帧 {next_output_frame} 使用追踪器缓存框绘制（{len(cached_tracks)}个目标）")
 
                     # 如果追踪器没有缓存框，使用最近一次检测结果进行插值绘制
-                    if not is_processed and last_processed_detections:
+                    detection_age = (
+                        current_timestamp - last_processed_detection_timestamp
+                        if last_processed_detection_timestamp > 0 else float('inf')
+                    )
+                    frame_gap = next_output_frame - last_processed_detection_frame_number
+                    can_reuse_last_detection = (
+                        last_processed_detections and
+                        last_processed_detection_frame_number > 0 and
+                        detection_age <= INTERPOLATED_DETECTION_MAX_AGE_SEC and
+                        frame_gap <= INTERPOLATED_DETECTION_MAX_FRAME_GAP
+                    )
+                    if not is_processed and can_reuse_last_detection:
                         # 将最近一次检测结果转换为追踪检测格式
                         interpolated_detections = []
                         for det in last_processed_detections:
@@ -2325,10 +2242,12 @@ def buffer_streamer_worker(device_id: str):
                     frame_buffer.pop(next_output_frame, None)
                     next_output_frame += 1
 
-                # 更新插值用的上一帧结果
-                if is_processed:
+                # 仅在当前帧有真实检测结果时更新插值缓存，避免旧框被无限继承
+                if frame_data.get('processed', False):
                     last_processed_frame = output_frame.copy()
                     last_processed_detections = frame_data.get('detections', [])
+                    last_processed_detection_timestamp = current_timestamp
+                    last_processed_detection_frame_number = next_output_frame - 1
 
                 output_count += 1
 
