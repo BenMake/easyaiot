@@ -25,6 +25,7 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import zlib
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -39,22 +40,98 @@ from models import db, AlgorithmTask, Device
 from app.utils.gb28181_source import resolve_gb28181_source
 
 
-def get_device():
-    """根据环境变量动态选择设备"""
+def _parse_gpu_id_list(value: str) -> List[int]:
+    if not value:
+        return []
+    ids: List[int] = []
+    for part in str(value).split(','):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            ids.append(int(p))
+        except Exception:
+            continue
+    # 去重但保序
+    seen = set()
+    result: List[int] = []
+    for x in ids:
+        if x in seen:
+            continue
+        seen.add(x)
+        result.append(x)
+    return result
+
+
+def _detect_visible_gpu_ids() -> List[int]:
+    """
+    返回当前进程“可见”的GPU索引列表（用于推理/ultralytics/torch）。
+    若 torch 不可用或CUDA不可用则返回空列表。
+    """
     use_gpu = os.environ.get('USE_GPU', 'False').lower() == 'true'
     if not use_gpu:
-        return 'cpu'
+        return []
 
     try:
-        import torch
-        if torch.cuda.is_available():
-            device_id = os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]
-            return f'cuda:{device_id}' if device_id else 'cuda'
-        else:
-            logging.warning('USE_GPU设置为True但CUDA不可用，回退到CPU')
-            return 'cpu'
+        import torch  # type: ignore
+        if not torch.cuda.is_available():
+            return []
+        n = int(torch.cuda.device_count())
+        if n <= 0:
+            return []
+        return list(range(n))
     except Exception:
-        return 'cpu'
+        return []
+
+
+_VISIBLE_GPU_IDS: List[int] = []
+_GPU_ASSIGNMENTS: Dict[str, int] = {}
+_GPU_RR_COUNTER = 0
+_GPU_SCHED_LOCK = threading.Lock()
+
+
+def _get_infer_gpu_policy() -> str:
+    v = (os.getenv("INFER_GPU_POLICY") or os.getenv("GPU_POLICY") or "hash").strip().lower()
+    return v if v in ("hash", "round_robin") else "hash"
+
+
+def _ensure_gpu_ids_initialized() -> None:
+    global _VISIBLE_GPU_IDS
+    if _VISIBLE_GPU_IDS:
+        return
+
+    configured = _parse_gpu_id_list(os.getenv("GPU_IDS", "").strip())
+    if configured:
+        _VISIBLE_GPU_IDS = configured
+        return
+    _VISIBLE_GPU_IDS = _detect_visible_gpu_ids()
+
+
+def _stable_key_hash(s: str) -> int:
+    return int(zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF)
+
+
+def get_infer_device(device_key: Any = None) -> str:
+    """给推理用：返回 'cpu' 或 'cuda:{idx}'，按设备稳定分配到多张GPU。"""
+    _ensure_gpu_ids_initialized()
+    if not _VISIBLE_GPU_IDS:
+        return "cpu"
+
+    key_str = str(device_key if device_key is not None else "default")
+    with _GPU_SCHED_LOCK:
+        cached = _GPU_ASSIGNMENTS.get(key_str)
+        if cached is None:
+            global _GPU_RR_COUNTER
+            policy = _get_infer_gpu_policy()
+            if policy == "round_robin":
+                idx = _GPU_RR_COUNTER % len(_VISIBLE_GPU_IDS)
+                _GPU_RR_COUNTER += 1
+                gpu_id = _VISIBLE_GPU_IDS[idx]
+            else:
+                gpu_id = _VISIBLE_GPU_IDS[_stable_key_hash(key_str) % len(_VISIBLE_GPU_IDS)]
+            _GPU_ASSIGNMENTS[key_str] = gpu_id
+            cached = gpu_id
+    return f"cuda:{cached}"
 
 
 # Flask应用实例（延迟创建，避免导入run模块时的副作用）
@@ -1902,7 +1979,7 @@ def yolo_detection_worker(worker_id: int):
                                     imgsz=YOLO_IMG_SIZE,  # 使用配置的检测分辨率（默认416，原640）
                                     verbose=False,
                                     half=False,
-                                    device=get_device()
+                                    device=get_infer_device(device_id_from_data)
                                 )
                                 result = results[0]
 

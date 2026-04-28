@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import pytz
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import zlib
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -40,22 +41,128 @@ from models import db, AlgorithmTask, Device
 from app.utils.gb28181_source import resolve_gb28181_source
 
 
-def get_device():
-    """根据环境变量动态选择设备"""
+def _parse_gpu_id_list(value: str) -> List[int]:
+    if not value:
+        return []
+    ids: List[int] = []
+    for part in str(value).split(','):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            ids.append(int(p))
+        except Exception:
+            continue
+    # 去重但保序
+    seen = set()
+    result: List[int] = []
+    for x in ids:
+        if x in seen:
+            continue
+        seen.add(x)
+        result.append(x)
+    return result
+
+
+def _detect_visible_gpu_ids() -> List[int]:
+    """
+    返回当前进程“可见”的GPU索引列表（用于推理/ultralytics/torch）。
+    - 若设置 CUDA_VISIBLE_DEVICES，torch 看到的是重映射后的连续索引（0..N-1），这里以 torch 为准。
+    - 若未安装 torch 或 CUDA 不可用，则返回空列表。
+    """
     use_gpu = os.environ.get('USE_GPU', 'False').lower() == 'true'
     if not use_gpu:
-        return 'cpu'
+        return []
 
     try:
-        import torch
-        if torch.cuda.is_available():
-            device_id = os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]
-            return f'cuda:{device_id}' if device_id else 'cuda'
-        else:
-            logging.warning('USE_GPU设置为True但CUDA不可用，回退到CPU')
-            return 'cpu'
+        import torch  # type: ignore
+        if not torch.cuda.is_available():
+            return []
+        n = int(torch.cuda.device_count())
+        if n <= 0:
+            return []
+        return list(range(n))
     except Exception:
-        return 'cpu'
+        return []
+
+
+# GPU调度（按设备稳定映射到多张GPU，避免全部压到0号卡）
+_VISIBLE_GPU_IDS: List[int] = []
+_GPU_ASSIGNMENTS: Dict[str, Dict[str, int]] = {"infer": {}, "ffmpeg": {}}
+_GPU_RR_COUNTER: Dict[str, int] = {"infer": 0, "ffmpeg": 0}
+_GPU_SCHED_LOCK = threading.Lock()
+
+
+def _get_gpu_policy(kind: str) -> str:
+    # kind: infer / ffmpeg
+    # 可选: hash | round_robin
+    v = (os.getenv(f"{kind.upper()}_GPU_POLICY") or os.getenv("GPU_POLICY") or "hash").strip().lower()
+    return v if v in ("hash", "round_robin") else "hash"
+
+
+def _ensure_gpu_ids_initialized() -> None:
+    global _VISIBLE_GPU_IDS
+    if _VISIBLE_GPU_IDS:
+        return
+
+    # 优先使用显式配置（GPU_IDS），否则按 torch 可见设备数自动探测
+    configured = _parse_gpu_id_list(os.getenv("GPU_IDS", "").strip())
+    if configured:
+        _VISIBLE_GPU_IDS = configured
+        return
+
+    _VISIBLE_GPU_IDS = _detect_visible_gpu_ids()
+
+
+def _stable_key_hash(s: str) -> int:
+    # Python 内置 hash() 在不同进程/启动间可能随机化，这里用 crc32 保证稳定映射
+    return int(zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF)
+
+
+def get_assigned_gpu_id(device_key: Any, kind: str) -> Optional[int]:
+    """
+    为某个 device_key 分配GPU索引。
+    kind:
+    - infer: 算法推理
+    - ffmpeg: 编码/推流（h264_nvenc 的 -gpu 参数）
+    """
+    kind = (kind or "").strip().lower()
+    if kind not in ("infer", "ffmpeg"):
+        kind = "infer"
+
+    _ensure_gpu_ids_initialized()
+    if not _VISIBLE_GPU_IDS:
+        return None
+
+    key_str = str(device_key)
+    with _GPU_SCHED_LOCK:
+        cached = _GPU_ASSIGNMENTS[kind].get(key_str)
+        if cached is not None:
+            return cached
+
+        policy = _get_gpu_policy(kind)
+        if policy == "round_robin":
+            idx = _GPU_RR_COUNTER[kind] % len(_VISIBLE_GPU_IDS)
+            _GPU_RR_COUNTER[kind] += 1
+            gpu_id = _VISIBLE_GPU_IDS[idx]
+        else:
+            gpu_id = _VISIBLE_GPU_IDS[_stable_key_hash(key_str) % len(_VISIBLE_GPU_IDS)]
+
+        _GPU_ASSIGNMENTS[kind][key_str] = gpu_id
+        return gpu_id
+
+
+def get_infer_device(device_key: Any = None) -> str:
+    """给推理用：返回 'cpu' 或 'cuda:{idx}'"""
+    gpu_id = get_assigned_gpu_id(device_key if device_key is not None else "default", kind="infer")
+    if gpu_id is None:
+        return "cpu"
+    return f"cuda:{gpu_id}"
+
+
+def get_ffmpeg_gpu_id(device_key: Any = None) -> Optional[int]:
+    """给FFmpeg用：返回整数GPU索引（传给 -gpu），无GPU时返回None"""
+    return get_assigned_gpu_id(device_key if device_key is not None else "default", kind="ffmpeg")
 
 
 # Flask应用实例（延迟创建，避免导入run模块时的副作用）
@@ -1907,6 +2014,7 @@ def buffer_streamer_worker(device_id: str):
                     # 根据编码器类型构建FFmpeg命令
                     if device_codec == 'h264_nvenc':
                         # 使用NVIDIA硬件编码器
+                        ffmpeg_gpu_id = get_ffmpeg_gpu_id(device_id)
                         ffmpeg_cmd.extend([
                             "-c:v", "h264_nvenc",
                             "-b:v", effective_bitrate,
@@ -1914,7 +2022,7 @@ def buffer_streamer_worker(device_id: str):
                             "-preset", "p4",  # NVENC预设：p1(最快)到p7(最慢)，p4为平衡
                             "-tune", "ll",  # 低延迟调优
                             "-zerolatency", "1",
-                            "-gpu", "0",  # 使用第一个GPU
+                            "-gpu", str(ffmpeg_gpu_id if ffmpeg_gpu_id is not None else 0),
                             "-g", str(gop_size_for_low_latency),
                             "-rc", "cbr",  # 恒定比特率模式
                             "-rc-lookahead", "0",  # 禁用lookahead以降低延迟
@@ -2656,7 +2764,7 @@ def yolo_detection_worker(worker_id: int):
                                 imgsz=YOLO_IMG_SIZE,  # 使用配置的检测分辨率（默认416，原640）
                                 verbose=False,
                                 half=False,
-                                device=get_device()
+                                device=get_infer_device(device_id_from_data)
                             )
                             result = results[0]
 

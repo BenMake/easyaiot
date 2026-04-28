@@ -27,6 +27,7 @@ import socket
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import zlib
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -66,6 +67,78 @@ def get_flask_app():
 
 # 加载环境变量
 load_dotenv()
+
+# GPU调度（按设备稳定映射到多张GPU，避免全部压到0号卡）
+def _parse_gpu_id_list(value: str) -> List[int]:
+    if not value:
+        return []
+    ids: List[int] = []
+    for part in str(value).split(','):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            ids.append(int(p))
+        except Exception:
+            continue
+    seen = set()
+    result: List[int] = []
+    for x in ids:
+        if x in seen:
+            continue
+        seen.add(x)
+        result.append(x)
+    return result
+
+
+def _stable_key_hash(s: str) -> int:
+    return int(zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF)
+
+
+_GPU_IDS: List[int] = []
+_GPU_ASSIGNMENTS: Dict[str, int] = {}
+_GPU_RR_COUNTER = 0
+_GPU_SCHED_LOCK = threading.Lock()
+
+
+def _get_gpu_policy() -> str:
+    v = (os.getenv("FFMPEG_GPU_POLICY") or os.getenv("GPU_POLICY") or "hash").strip().lower()
+    return v if v in ("hash", "round_robin") else "hash"
+
+
+def _ensure_gpu_ids_initialized() -> None:
+    global _GPU_IDS
+    if _GPU_IDS:
+        return
+    configured = _parse_gpu_id_list(os.getenv("GPU_IDS", "").strip())
+    _GPU_IDS = configured if configured else [0]
+
+
+def get_ffmpeg_gpu_id(device_key: Any = None) -> int:
+    """
+    给FFmpeg用：返回整数GPU索引（传给 -gpu）。
+    默认至少返回0（即使未配置多GPU）。
+    """
+    _ensure_gpu_ids_initialized()
+    if not _GPU_IDS:
+        return 0
+    key_str = str(device_key if device_key is not None else "default")
+    with _GPU_SCHED_LOCK:
+        cached = _GPU_ASSIGNMENTS.get(key_str)
+        if cached is not None:
+            return cached
+
+        global _GPU_RR_COUNTER
+        policy = _get_gpu_policy()
+        if policy == "round_robin":
+            idx = _GPU_RR_COUNTER % len(_GPU_IDS)
+            _GPU_RR_COUNTER += 1
+            gpu_id = _GPU_IDS[idx]
+        else:
+            gpu_id = _GPU_IDS[_stable_key_hash(key_str) % len(_GPU_IDS)]
+
+        _GPU_ASSIGNMENTS[key_str] = gpu_id
+        return gpu_id
 
 # ============================================
 # 自定义日志处理器
@@ -803,12 +876,13 @@ def pusher_worker():
                         # 根据硬件加速配置选择编码器
                         if use_hardware:
                             # 使用硬件编码 h264_nvenc
+                            ffmpeg_gpu_id = get_ffmpeg_gpu_id(device_id)
                             ffmpeg_cmd.extend([
                                 "-c:v", "h264_nvenc",
                                 "-b:v", effective_bitrate,
                                 "-preset", "p3",  # p3是低延迟预设
                                 "-tune", "ll",  # 低延迟调优
-                                "-gpu", "0",  # 使用GPU 0
+                                "-gpu", str(ffmpeg_gpu_id),
                                 "-rc", "vbr",  # 可变比特率
                                 "-profile:v", "main",
                                 "-level", "4.0",
