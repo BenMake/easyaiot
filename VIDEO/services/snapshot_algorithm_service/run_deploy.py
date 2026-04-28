@@ -229,12 +229,12 @@ last_alert_time = {}  # {device_id: timestamp}（已废弃，不再使用）
 alert_suppression_interval = 5.0  # 告警抑制间隔：5秒（已废弃，不再使用）
 alert_time_lock = threading.Lock()  # 告警时间戳锁（已废弃，不再使用）
 
-# 配置参数（从数据库读取，支持环境变量覆盖以降低CPU占用）
+# 配置参数（抓拍算法链路）：优先 AI_*，回退到历史通用变量
 # 帧率：降低可减少CPU占用
-SOURCE_FPS = int(os.getenv('SOURCE_FPS', '25'))  # 默认25fps（高清流畅）
-# 分辨率：降低可大幅减少CPU占用
-TARGET_WIDTH = int(os.getenv('TARGET_WIDTH', '1280'))  # 默认1280（高清）
-TARGET_HEIGHT = int(os.getenv('TARGET_HEIGHT', '720'))  # 默认720（高清）
+SOURCE_FPS = int(os.getenv('AI_SOURCE_FPS', os.getenv('SOURCE_FPS', '25')))  # 默认25fps
+# 分辨率：抓拍任务用于读取/抽帧/推理的目标分辨率（可独立于观看链路）
+TARGET_WIDTH = int(os.getenv('AI_TARGET_WIDTH', os.getenv('TARGET_WIDTH', '1280')))
+TARGET_HEIGHT = int(os.getenv('AI_TARGET_HEIGHT', os.getenv('TARGET_HEIGHT', '720')))
 TARGET_RESOLUTION = (TARGET_WIDTH, TARGET_HEIGHT)
 EXTRACT_INTERVAL = int(os.getenv('EXTRACT_INTERVAL', '2'))
 BUFFER_SIZE = int(os.getenv('BUFFER_SIZE', '70'))
@@ -251,8 +251,8 @@ PUSH_QUEUE_SIZE = int(os.getenv('PUSH_QUEUE_SIZE', '100'))  # 推帧队列大小
 EXTRACT_QUEUE_SIZE = int(os.getenv('EXTRACT_QUEUE_SIZE', '1'))  # 抽帧队列大小（默认1，每个摄像头只保留1帧）
 # 检测工作线程数量（优化以提升处理能力）
 YOLO_WORKER_THREADS = int(os.getenv('YOLO_WORKER_THREADS', '2'))  # YOLO检测线程数（默认2，原1）
-# 画质分档（low/medium/high）
-VIDEO_QUALITY_PROFILE = os.getenv('VIDEO_QUALITY_PROFILE', '').strip().lower()
+# 画质分档（抓拍算法链路）：优先 AI_VIDEO_QUALITY_PROFILE
+VIDEO_QUALITY_PROFILE = os.getenv('AI_VIDEO_QUALITY_PROFILE', os.getenv('VIDEO_QUALITY_PROFILE', '')).strip().lower()
 QUALITY_PROFILE_PRESETS = {
     'low': {
         'source_fps': 15,
