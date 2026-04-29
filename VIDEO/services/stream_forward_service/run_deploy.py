@@ -632,6 +632,11 @@ def buffer_worker(device_id: str):
     cap = None
     retry_count = 0
     max_retries = 5
+    rtsp_open_timeout_msec = int(os.getenv("RTSP_OPEN_TIMEOUT_MSEC", "5000"))
+    rtsp_read_timeout_msec = int(os.getenv("RTSP_READ_TIMEOUT_MSEC", "2500"))
+    rtsp_retry_delay_sec = max(0.1, float(os.getenv("RTSP_RETRY_DELAY_SEC", "1")))
+    rtsp_retry_cooldown_sec = max(1.0, float(os.getenv("RTSP_RETRY_COOLDOWN_SEC", "8")))
+    rtsp_read_fail_delay_sec = max(0.1, float(os.getenv("RTSP_READ_FAIL_DELAY_SEC", "0.3")))
     
     while not stop_event.is_set():
         try:
@@ -654,11 +659,11 @@ def buffer_worker(device_id: str):
                     # 设置超时参数
                     if rtsp_url.startswith('rtmp://') or rtsp_url.startswith('rtsp://'):
                         try:
-                            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
+                            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, rtsp_open_timeout_msec)
                         except (AttributeError, cv2.error):
                             pass
                         try:
-                            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, rtsp_read_timeout_msec)
                         except (AttributeError, cv2.error):
                             pass
                     
@@ -673,24 +678,24 @@ def buffer_worker(device_id: str):
                     retry_count += 1
                     if retry_count >= max_retries:
                         logger.error(f"❌ 设备 {device_id} 连接 {stream_type} 流失败，已达到最大重试次数 {max_retries}")
-                        logger.info("等待30秒后重新尝试...")
-                        time.sleep(30)
+                        logger.info(f"等待{rtsp_retry_cooldown_sec:.1f}秒后重新尝试...")
+                        time.sleep(rtsp_retry_cooldown_sec)
                         retry_count = 0
                     else:
                         logger.warning(f"设备 {device_id} 无法打开 {stream_type} 流，等待重试... ({retry_count}/{max_retries})")
-                        time.sleep(2)
+                        time.sleep(rtsp_retry_delay_sec)
                     continue
                 
                 if not cap.isOpened():
                     retry_count += 1
                     if retry_count >= max_retries:
                         logger.error(f"❌ 设备 {device_id} 连接 {stream_type} 流失败，已达到最大重试次数 {max_retries}")
-                        logger.info("等待30秒后重新尝试...")
-                        time.sleep(30)
+                        logger.info(f"等待{rtsp_retry_cooldown_sec:.1f}秒后重新尝试...")
+                        time.sleep(rtsp_retry_cooldown_sec)
                         retry_count = 0
                     else:
                         logger.warning(f"设备 {device_id} 无法打开 {stream_type} 流，等待重试... ({retry_count}/{max_retries})")
-                        time.sleep(2)
+                        time.sleep(rtsp_retry_delay_sec)
                     if cap is not None:
                         try:
                             cap.release()
@@ -718,11 +723,11 @@ def buffer_worker(device_id: str):
                     device_caps.pop(device_id, None)
                 
                 # 等待后重试连接
-                time.sleep(1)
+                time.sleep(rtsp_read_fail_delay_sec)
                 retry_count += 1
                 if retry_count >= max_retries:
-                    logger.error(f"❌ 设备 {device_id} 读取帧失败次数过多，等待30秒后重新尝试...")
-                    time.sleep(30)
+                    logger.error(f"❌ 设备 {device_id} 读取帧失败次数过多，等待{rtsp_retry_cooldown_sec:.1f}秒后重新尝试...")
+                    time.sleep(rtsp_retry_cooldown_sec)
                     retry_count = 0
                 continue
             
