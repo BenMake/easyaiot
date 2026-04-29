@@ -1428,8 +1428,7 @@ def _is_likely_rtsp_flat_corrupt_frame(
     mean_hi: float = 180.0,
 ) -> bool:
     """
-    判断整帧是否像解码失败后的灰屏/塌缩（OpenCV 仍可能 ret=True）。
-    子码流 H.265+UDP 丢参考帧时常见全图近常数或低方差中灰。
+    典型解码「中灰塌缩」屏；仅中灰且极低方差判定，避免夜景误杀。
     """
     if frame is None or frame.size == 0:
         return True
@@ -1440,11 +1439,7 @@ def _is_likely_rtsp_flat_corrupt_frame(
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _mean, _std = cv2.meanStdDev(gray)
         m, s = float(_mean[0][0]), float(_std[0][0])
-        if s < 2.0:
-            return True
-        if s < std_max and mean_lo < m < mean_hi:
-            return True
-        return False
+        return bool(mean_lo <= m <= mean_hi and s < std_max)
     except Exception:
         return False
 
@@ -1492,12 +1487,12 @@ def buffer_streamer_worker(device_id: str):
     last_frame_time = time.time()
     max_push_process_per_cycle = 20
 
-    # 灰屏/解码塌缩检测（环境变量 AI_RTSP_GRAY_*，与实时算法服务一致）
+    # 灰屏重连（默认开启；与实时算法服务一致，见 AI_RTSP_GRAY_*）
     _gray_reconnect = (os.getenv("AI_RTSP_GRAY_RECONNECT", "1").strip().lower() not in ("0", "false", "no", "off"))
     try:
-        _gray_streak_need = max(1, int((os.getenv("AI_RTSP_GRAY_STREAK", "3").strip() or "3")))
+        _gray_streak_need = max(1, int((os.getenv("AI_RTSP_GRAY_STREAK", "20").strip() or "20")))
     except Exception:
-        _gray_streak_need = 3
+        _gray_streak_need = 20
 
     def _gray_float(name: str, default: float) -> float:
         try:
@@ -1508,7 +1503,10 @@ def buffer_streamer_worker(device_id: str):
     _gray_std_max = _gray_float("AI_RTSP_GRAY_STD_MAX", 4.0)
     _gray_mean_lo = _gray_float("AI_RTSP_GRAY_MEAN_LO", 80.0)
     _gray_mean_hi = _gray_float("AI_RTSP_GRAY_MEAN_HI", 180.0)
+    _gray_warmup_sec = _gray_float("AI_RTSP_GRAY_WARMUP_SEC", 15.0)
+    _gray_reconnect_delay = _gray_float("AI_RTSP_GRAY_RECONNECT_DELAY_SEC", 2.0)
     gray_bad_streak = 0
+    last_rtsp_connect_time = 0.0
 
     def process_detection_results_and_cleanup():
         """异步消费检测结果并清理超时帧，避免检测慢导致延迟累积。"""
@@ -1744,6 +1742,8 @@ def buffer_streamer_worker(device_id: str):
                 retry_count = 0
                 device_caps[device_id] = cap
                 logger.info(f"✅ 设备 {device_id} {stream_type} 流连接成功")
+                if rtsp_url.startswith("rtsp://"):
+                    last_rtsp_connect_time = time.time()
 
             # 从源流读取帧
             ret, frame = cap.read()
@@ -1758,28 +1758,32 @@ def buffer_streamer_worker(device_id: str):
                 time.sleep(1)
                 continue
 
-            if rtsp_url.startswith("rtsp://") and _gray_reconnect:
-                if _is_likely_rtsp_flat_corrupt_frame(
+            if (
+                rtsp_url.startswith("rtsp://")
+                and _gray_reconnect
+                and (time.time() - last_rtsp_connect_time) >= _gray_warmup_sec
+                and _is_likely_rtsp_flat_corrupt_frame(
                     frame, _gray_std_max, _gray_mean_lo, _gray_mean_hi
-                ):
-                    gray_bad_streak += 1
-                    if gray_bad_streak >= _gray_streak_need:
-                        logger.warning(
-                            f"设备 {device_id} 连续 {gray_bad_streak} 帧疑似解码灰屏/塌缩，释放并重连 RTSP"
-                        )
-                        if cap is not None:
-                            try:
-                                cap.release()
-                            except Exception:
-                                pass
-                            cap = None
-                            device_caps.pop(device_id, None)
-                        gray_bad_streak = 0
-                        process_detection_results_and_cleanup()
-                        time.sleep(0.5)
-                        continue
+                )
+            ):
+                gray_bad_streak += 1
+                if gray_bad_streak >= _gray_streak_need:
+                    logger.warning(
+                        f"设备 {device_id} 连续 {gray_bad_streak} 帧疑似解码灰屏/塌缩，释放并重连 RTSP"
+                    )
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                        device_caps.pop(device_id, None)
+                    gray_bad_streak = 0
                     process_detection_results_and_cleanup()
+                    time.sleep(max(0.5, _gray_reconnect_delay))
                     continue
+                process_detection_results_and_cleanup()
+                continue
             gray_bad_streak = 0
 
             # 抓拍算法任务：只在cron时间点处理1帧，其他帧完全跳过
