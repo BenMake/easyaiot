@@ -26,13 +26,15 @@ public class HikOpenApiCameraService {
 
     public Map<String, Object> queryAllCameras(HikPlatformAuthRequest request) {
         String protocol = request.getProtocol().toLowerCase(Locale.ROOT);
-        ArtemisConfig config = new ArtemisConfig(normalizeHost(request.getHost()), request.getAppKey(), request.getAppSecret());
+        ArtemisConfig.host = normalizeHost(request.getHost());
+        ArtemisConfig.appKey = request.getAppKey();
+        ArtemisConfig.appSecret = request.getAppSecret();
         int pageNo = 1;
         int pageSize = 200;
         int total = 0;
         List<Map<String, Object>> cameras = new ArrayList<>();
         while (true) {
-            JsonNode root = invokeCameraSearch(config, protocol, pageNo, pageSize);
+            JsonNode root = invokeCameraSearch(protocol, pageNo, pageSize);
             JsonNode dataNode = root.path("data");
             if (total == 0) {
                 total = dataNode.path("total").asInt(0);
@@ -65,7 +67,7 @@ public class HikOpenApiCameraService {
         return result;
     }
 
-    private JsonNode invokeCameraSearch(ArtemisConfig config, String protocol, int pageNo, int pageSize) {
+    private JsonNode invokeCameraSearch(String protocol, int pageNo, int pageSize) {
         try {
             Map<String, String> path = new HashMap<>(2);
             path.put(protocol + "://", CAMERA_SEARCH_API);
@@ -74,7 +76,6 @@ public class HikOpenApiCameraService {
             body.put("pageNo", pageNo);
             body.put("pageSize", pageSize);
             String result = ArtemisHttpUtil.doPostStringArtemis(
-                    config,
                     path,
                     objectMapper.writeValueAsString(body),
                     null,
