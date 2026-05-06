@@ -227,6 +227,12 @@
             <scope>system</scope>
             <systemPath>${project.basedir}/src/main/resources/lib/java-vector-tile-1.4.1.jar</systemPath>
         </dependency>
+        <!-- system 依赖不传递：java-vector-tile 1.4.x 需 protobuf-java 4.29+ -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>4.29.3</version>
+        </dependency>
 
         <!-- 获取系统信息 -->
         <dependency>
