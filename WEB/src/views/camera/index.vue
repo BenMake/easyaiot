@@ -18,23 +18,11 @@
               <BasicTable v-if="viewMode === 'table'" @register="registerTable">
                 <template #toolbar>
                   <div class="toolbar-buttons">
-                    <a-button type="primary" @click="handleScanOnvif">
-                      <template #icon>
-                        <ScanOutlined/>
-                      </template>
-                      扫描局域网ONVIF设备
-                    </a-button>
                     <a-button @click="openAddModal('source')">
                       <template #icon>
                         <VideoCameraAddOutlined/>
                       </template>
                       新增直连设备
-                    </a-button>
-                    <a-button @click="handleUpdateOnvifDevice">
-                      <template #icon>
-                        <SyncOutlined/>
-                      </template>
-                      更新ONVIF设备
                     </a-button>
                     <a-button @click="handleToggleViewMode" type="default">
                       <template #icon>
@@ -81,23 +69,11 @@
                   @toggleStream="handleCardToggleStream"
                 >
                   <template #header>
-                    <a-button type="primary" @click="handleScanOnvif">
-                      <template #icon>
-                        <ScanOutlined/>
-                      </template>
-                      扫描局域网ONVIF设备
-                    </a-button>
                     <a-button @click="openAddModal('source')">
                       <template #icon>
                         <VideoCameraAddOutlined/>
                       </template>
                       新增直连设备
-                    </a-button>
-                    <a-button @click="handleUpdateOnvifDevice">
-                      <template #icon>
-                        <SyncOutlined/>
-                      </template>
-                      更新ONVIF设备
                     </a-button>
                     <a-button @click="handleToggleViewMode" type="default">
                       <template #icon>
@@ -149,6 +125,9 @@
         <TabPane key="10" tab="GB28181节点管理">
           <Gb28181Node ref="gb28181NodeRef"/>
         </TabPane>
+        <TabPane key="11" tab="ONVIF扫描">
+          <OnvifScan />
+        </TabPane>
       </Tabs>
     </div>
   </div>
@@ -168,12 +147,11 @@ import {
   DeviceInfo,
   getDeviceList,
   getStreamStatus,
-  refreshDevices,
   startStreamForwarding,
   stopStreamForwarding,
   StreamStatusResponse
 } from '@/api/device/camera';
-import {ScanOutlined, SyncOutlined, VideoCameraAddOutlined, SwapOutlined} from '@ant-design/icons-vue';
+import {VideoCameraAddOutlined, SwapOutlined} from '@ant-design/icons-vue';
 import DialogPlayer from "@/components/VideoPlayer/DialogPlayer.vue";
 import DirectoryManage from "./components/DirectoryManage/index.vue";
 import SnapSpace from "./components/SnapSpace/index.vue";
@@ -185,6 +163,7 @@ import Gb28181SplitScreen from "@/views/gb28181/components/SplitScreen/index.vue
 import Gb28181Video from "@/views/gb28181/components/Video/index.vue";
 import Gb28181PullProxy from "@/views/gb28181/components/PullProxy/index.vue";
 import Gb28181Node from "@/views/gb28181/components/Node/index.vue";
+import OnvifScan from "./components/OnvifScan/index.vue";
 
 defineOptions({name: 'CAMERA'})
 
@@ -558,11 +537,6 @@ const openAddModal = (type, record = null) => {
   });
 };
 
-// 扫描ONVIF设备
-const handleScanOnvif = () => {
-  openAddModal('onvif');
-};
-
 // 刷新数据
 const handleSuccess = () => {
   if (viewMode.value === 'table') {
@@ -581,18 +555,6 @@ const handleDelete = async (record) => {
   } catch (error) {
     console.error('删除失败', error);
     createMessage.error('删除失败');
-  }
-};
-
-// 更新ONVIF设备
-const handleUpdateOnvifDevice = async () => {
-  try {
-    await refreshDevices();
-    createMessage.success('ONVIF设备更新成功');
-    handleSuccess();
-  } catch (error) {
-    console.error('ONVIF设备更新失败', error);
-    createMessage.error('ONVIF设备更新失败');
   }
 };
 

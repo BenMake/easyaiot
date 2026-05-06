@@ -126,13 +126,16 @@ public class RegisterRequestProcessor extends SIPRequestProcessorParent implemen
                         password = (!ObjectUtils.isEmpty(device.getPassword())) ? device.getPassword() : sipConfig.getPassword();
                     }
                 }
-            }else {
+            } else {
+                // 未预置设备：需要公共密码才能完成 Digest 鉴权；若已关闭 REGISTER 鉴权，则允许无公共密码直接入库（兼容无密码设备）
                 if (ObjectUtils.isEmpty(sipConfig.getPassword())) {
-                    log.info("{} 设备：{}, 地址: {}, 公共密码已经禁用，请添加用户信息后注册", title, deviceId, requestAddress);
-                    response = getMessageFactory().createResponse(Response.FORBIDDEN, request);
-                    sipSender.transmitRequest(request.getLocalAddress().getHostAddress(), response);
-                    return;
-                }else {
+                    if (sipConfig.isRegisterPasswordAuth()) {
+                        log.info("{} 设备：{}, 地址: {}, 公共密码已经禁用，请添加用户信息后注册", title, deviceId, requestAddress);
+                        response = getMessageFactory().createResponse(Response.FORBIDDEN, request);
+                        sipSender.transmitRequest(request.getLocalAddress().getHostAddress(), response);
+                        return;
+                    }
+                } else {
                     password = sipConfig.getPassword();
                 }
             }

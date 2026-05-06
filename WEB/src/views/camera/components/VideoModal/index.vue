@@ -10,34 +10,6 @@
   >
     <div class="product-modal">
       <Spin :spinning="state.editLoading">
-        <!-- ONVIF组件 -->
-        <Form
-          :labelCol="{ span: 6 }"
-          :model="validateInfos"
-          :wrapperCol="{ span: 16 }"
-          v-if="state.type=='onvif' && !state.isView && !state.isEdit"
-        >
-          <BasicTable @register="registerTable">
-            <template #bodyCell="{ column, record }">
-              <template v-if="column.dataIndex === 'action'">
-                <TableAction
-                  :stopButtonPropagation="true"
-                  :actions="[
-                    {
-                      icon: 'famicons:bag-add-outline',
-                      tooltip: {
-                        title: '注册设备',
-                        placement: 'top',
-                      },
-                      label: '注册设备',
-                      onClick: openRegisterModal.bind(null, true, { record })
-                    },
-                  ]"
-                />
-              </template>
-            </template>
-          </BasicTable>
-        </Form>
         <!-- 直连设备表单（新增：摄像头类型选择） -->
         <Form
           :labelCol="{ span: 6 }"
@@ -228,8 +200,6 @@
           </Row>
         </Form>
       </Spin>
-      <VideoRegisterModal title="注册设备" @register="registerRegisterModel"
-                          @success="handleRegisterSuccess"/>
     </div>
   </BasicModal>
 </template>
@@ -240,15 +210,8 @@ import {Col, Form, FormItem, Input, Row, Select, Spin,} from 'ant-design-vue';
 import {CopyOutlined} from '@ant-design/icons-vue';
 import {useMessage} from '@/hooks/web/useMessage';
 import {copyText} from '@/utils/copyTextToClipboard';
-// 导入新的API函数
-import {discoverDevices, getDeviceList, registerDevice, updateDevice} from "@/api/device/camera";
+import {getDeviceList, registerDevice, updateDevice} from "@/api/device/camera";
 import {ensureDeviceStreamForwardTask} from "@/api/device/stream_forward";
-import {BasicTable, TableAction, useTable} from "@/components/Table";
-import {getOnvifBasicColumns, getOnvifFormConfig} from "./Data";
-import VideoRegisterModal from "../VideoRegisterModal/index.vue";
-
-const [registerRegisterModel, {openModal: openRegisterModal}] = useModal();
-
 defineOptions({name: 'VideoModal'})
 
 const {createMessage} = useMessage();
@@ -342,58 +305,6 @@ const [register, {closeModal}] = useModalInner(async (data) => {
 });
 
 const emits = defineEmits(['success']);
-
-const checkedKeys = ref<Array<string>>([]);
-
-function onSelect(record, selected) {
-  if (selected) {
-    checkedKeys.value = [...checkedKeys.value, record.ip];
-  } else {
-    checkedKeys.value = checkedKeys.value.filter((ip) => ip !== record.ip);
-  }
-}
-
-function onSelectAll(selected, selectedRows, changeRows) {
-  const changeIds = changeRows.map((item) => item.ip);
-  if (selected) {
-    checkedKeys.value = [...checkedKeys.value, ...changeIds];
-  } else {
-    checkedKeys.value = checkedKeys.value.filter((ip) => {
-      return !changeIds.includes(ip);
-    });
-  }
-}
-
-const [
-  registerTable, {reload}
-] = useTable({
-  canResize: false,
-  showIndexColumn: false,
-  title: null,
-  api: discoverDevices,
-  columns: getOnvifBasicColumns(),
-  useSearchForm: true,
-  showTableSetting: false,
-  formConfig: getOnvifFormConfig(),
-  fetchSetting: {
-    listField: 'list',
-    totalField: 'total',
-  },
-  rowSelection: {
-    type: 'checkbox',
-    selectedRowKeys: checkedKeys,
-    onSelect: onSelect,
-    onSelectAll: onSelectAll,
-    getCheckboxProps(record) {
-      if (record.default || record.referencedByDevice) {
-        return {disabled: true};
-      } else {
-        return {disabled: false};
-      }
-    },
-  },
-  rowKey: 'ip',
-});
 
 // 动态验证规则函数
 const getRules = () => {
@@ -594,66 +505,6 @@ function handleCopyRtsp() {
   copyText(modelRef.source, 'RTSP地址已复制到剪贴板');
 }
 
-function handleRegisterSuccess(value) {
-  const ip = value['ip'];
-  const name = value['name'];
-  const stream = value['stream'];
-  const username = value['username'];
-  const password = value['password'];
-  if (ip == null || ip === '') {
-    createMessage.error('IP地址不能为空');
-    return;
-  }
-  if (name == null || name === '') {
-    createMessage.error('设备名称不能为空');
-    return;
-  }
-  if (username == null || username === '' || password === null || password === '') {
-    createMessage.error('用户名与密码不能为空');
-    return;
-  }
-
-  state.editLoading = true;
-
-  if (state.type === 'onvif') {
-    let port = 80;
-    let arr = ip.split(":");
-    if (arr.length > 1) {
-      port = arr[1];
-    }
-    modelRef.ip = arr[0];
-    modelRef.port = port;
-    modelRef.name = name;
-    modelRef.stream = stream;
-    modelRef.username = username;
-    modelRef.password = password;
-
-    registerDevice(modelRef)
-      .then(async (response) => {
-        const deviceId = response?.data?.id;
-        createMessage.success('设备注册成功');
-        
-        // 检查并确保推流转发任务存在
-        if (deviceId) {
-          try {
-            await ensureDeviceStreamForwardTask(deviceId);
-          } catch (error) {
-            // 静默处理，不影响主流程
-            console.warn('检查推流转发任务失败:', error);
-          }
-        }
-        
-        closeModal();
-        resetFields();
-        emits('success');
-      })
-      .finally(() => {
-        state.editLoading = false;
-      });
-    return;
-  }
-}
-
 const useForm = Form.useForm;
 const {validate, resetFields, clearValidate, validateInfos} = useForm(modelRef, rulesRef);
 
@@ -690,12 +541,6 @@ function handleCancel() {
 }
 
 function handleOk() {
-  if (state.type == 'onvif') {
-    closeModal();
-    resetFields();
-    return;
-  }
-
   // 直连设备特殊处理：直接注册，不再通过ONVIF搜索
   if (state.type === 'source' && !state.isEdit && !state.isView) {
     // 先进行自定义验证
