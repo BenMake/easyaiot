@@ -152,6 +152,54 @@ def get_kafka_producer():
     return _producer
 
 
+def _kafka_topic_for_alert_task_type(task_type: str) -> str:
+    """根据算法任务类型解析 Kafka 告警主题（与下方分发逻辑一致）。"""
+    tt = task_type or 'realtime'
+    if tt == 'snapshot':
+        tt = 'snap'
+    try:
+        if tt == 'snap':
+            return current_app.config.get('KAFKA_SNAPSHOT_ALERT_TOPIC', 'iot-snapshot-alert')
+        return current_app.config.get('KAFKA_ALERT_NOTIFICATION_TOPIC', 'iot-alert-notification')
+    except RuntimeError:
+        import os
+        if tt == 'snap':
+            return os.getenv('KAFKA_SNAPSHOT_ALERT_TOPIC', 'iot-snapshot-alert')
+        return os.getenv('KAFKA_ALERT_NOTIFICATION_TOPIC', 'iot-alert-notification')
+
+
+def _build_minimal_alert_kafka_message(
+        alert_data: Dict,
+        detection_switches: Optional[Dict],
+) -> Dict:
+    """
+    精简告警 Kafka 消息（无通知人配置时使用）。
+    必须与 iot-sink AlertNotificationMessage / Python 驼峰字段一致，否则 sink 无法解析 imagePath、无法上传 MinIO。
+    """
+    sw = detection_switches or {}
+    return {
+        'deviceId': alert_data.get('device_id'),
+        'deviceName': alert_data.get('device_name'),
+        'alert': {
+            'object': alert_data.get('object'),
+            'event': alert_data.get('event'),
+            'region': alert_data.get('region'),
+            'information': alert_data.get('information'),
+            'imagePath': alert_data.get('image_path'),
+            'recordPath': alert_data.get('record_path'),
+            'time': alert_data.get('time', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+            'taskType': alert_data.get('task_type', 'realtime'),
+        },
+        'notifyUsers': None,
+        'notifyMethods': None,
+        'channels': None,
+        'faceDetectionEnabled': bool(sw.get('face_detection_enabled', False)),
+        'plateDetectionEnabled': bool(sw.get('plate_detection_enabled', False)),
+        'shouldNotify': False,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+
 def _query_alert_notification_config(device_id: str, task_type: str = None) -> Optional[Dict]:
     """
     查询设备的告警通知配置
@@ -509,37 +557,30 @@ def process_alert_hook(alert_data: Dict) -> Dict:
                         detection_switches
                     )
                     
-                    # 如果通知消息为None，说明通知人列表为空，跳过发送
+                    # 通知人列表为空时原先会直接跳过 Kafka → iot-sink 无法落库/上传 MinIO，image_url 永远为空
                     if notification_message is None:
-                        logger.warning(f"⚠️  告警通知消息构建失败（通知人列表为空），跳过发送: device_id={device_id}")
-                        return {'status': 'skipped', 'reason': 'no_notify_users'}
+                        logger.warning(
+                            f"⚠️  告警通知消息构建失败（通知人列表为空），"
+                            f"将发送精简消息以保证 iot-sink 落库与 MinIO: device_id={device_id}"
+                        )
+                        notification_message = _build_minimal_alert_kafka_message(
+                            alert_data, detection_switches
+                        )
                     
-                    # 从Flask配置中获取Kafka主题（根据任务类型选择不同的topic）
-                    task_type = alert_data.get('task_type', 'realtime')  # 默认为实时算法任务
-                    # 兼容 'snapshot' 值，统一转换为 'snap'
-                    if task_type == 'snapshot':
-                        task_type = 'snap'
-                    try:
-                        if task_type == 'snap':
-                            # 抓拍算法任务使用单独的topic
-                            kafka_topic = current_app.config.get('KAFKA_SNAPSHOT_ALERT_TOPIC', 'iot-snapshot-alert')
-                        else:
-                            # 实时算法任务使用原有topic
-                            kafka_topic = current_app.config.get('KAFKA_ALERT_NOTIFICATION_TOPIC', 'iot-alert-notification')
-                    except RuntimeError:
-                        import os
-                        if task_type == 'snap':
-                            kafka_topic = os.getenv('KAFKA_SNAPSHOT_ALERT_TOPIC', 'iot-snapshot-alert')
-                        else:
-                            kafka_topic = os.getenv('KAFKA_ALERT_NOTIFICATION_TOPIC', 'iot-alert-notification')
+                    kafka_topic = _kafka_topic_for_alert_task_type(
+                        alert_data.get('task_type', 'realtime')
+                    )
                     
                     # 记录发送信息
                     should_notify = notification_message.get('shouldNotify', False)
-                    notify_users_count = len(notification_message.get('notifyUsers', []))
+                    _nu = notification_message.get('notifyUsers')
+                    notify_users_count = len(_nu) if _nu else 0
+                    _ch = notification_message.get('channels')
+                    channels_count = len(_ch) if _ch else 0
                     logger.info(f"📤 准备发送告警通知消息到Kafka: device_id={device_id}, topic={kafka_topic}, "
                                f"shouldNotify={should_notify}, notifyUsers数量={notify_users_count}, "
                                f"notifyMethods={notification_message.get('notifyMethods')}, "
-                               f"channels数量={len(notification_message.get('channels', []))}")
+                               f"channels数量={channels_count}")
                     
                     # 使用device_id作为key，确保同一设备的告警消息有序
                     future = producer.send(
@@ -601,47 +642,13 @@ def process_alert_hook(alert_data: Dict) -> Dict:
             producer = get_kafka_producer()
             if producer is not None:
                 try:
-                    # 构建简单的告警消息（不包含通知配置，但标记为不需要通知）
-                    simple_message = {
-                        'deviceId': alert_data.get('device_id'),
-                        'deviceName': alert_data.get('device_name'),
-                        'alert': {
-                            'object': alert_data.get('object'),
-                            'event': alert_data.get('event'),
-                            'region': alert_data.get('region'),
-                            'information': alert_data.get('information'),
-                            'imagePath': alert_data.get('image_path'),
-                            'recordPath': alert_data.get('record_path'),
-                            'time': alert_data.get('time', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
-                            'taskType': alert_data.get('task_type', 'realtime')
-                        },
-                        'notifyUsers': None,  # 明确标记为null
-                        'notifyMethods': None,  # 明确标记为null
-                        'channels': None,  # 明确标记为null
-                        'faceDetectionEnabled': bool(detection_switches.get('face_detection_enabled', False)),
-                        'plateDetectionEnabled': bool(detection_switches.get('plate_detection_enabled', False)),
-                        'shouldNotify': False,  # 明确标记为不需要通知
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    
-                    # 从Flask配置中获取Kafka主题（根据任务类型选择不同的topic）
-                    task_type = alert_data.get('task_type', 'realtime')  # 默认为实时算法任务
-                    # 兼容 'snapshot' 值，统一转换为 'snap'
-                    if task_type == 'snapshot':
-                        task_type = 'snap'
-                    try:
-                        if task_type == 'snap':
-                            # 抓拍算法任务使用单独的topic
-                            kafka_topic = current_app.config.get('KAFKA_SNAPSHOT_ALERT_TOPIC', 'iot-snapshot-alert')
-                        else:
-                            # 实时算法任务使用原有topic
-                            kafka_topic = current_app.config.get('KAFKA_ALERT_NOTIFICATION_TOPIC', 'iot-alert-notification')
-                    except RuntimeError:
-                        import os
-                        if task_type == 'snap':
-                            kafka_topic = os.getenv('KAFKA_SNAPSHOT_ALERT_TOPIC', 'iot-snapshot-alert')
-                        else:
-                            kafka_topic = os.getenv('KAFKA_ALERT_NOTIFICATION_TOPIC', 'iot-alert-notification')
+                    simple_message = _build_minimal_alert_kafka_message(
+                        alert_data, detection_switches
+                    )
+
+                    kafka_topic = _kafka_topic_for_alert_task_type(
+                        alert_data.get('task_type', 'realtime')
+                    )
                     
                     logger.info(f"📤 准备发送告警消息（无通知配置）到Kafka: device_id={device_id}, topic={kafka_topic}, shouldNotify=False")
                     

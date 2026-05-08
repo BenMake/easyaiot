@@ -142,7 +142,9 @@ public class AlertServiceImpl implements AlertService {
                 updateAlertImagePath(alertId, minioPath);
                 log.debug("告警 {} 图片路径已更新: {}", alertId, minioPath);
             } else if (minioPath == null) {
-                log.warn("告警 {} 图片上传失败，保留原始路径: {}", alertId, imagePath);
+                log.warn("告警 {} MinIO 上传失败，image_url 未写入: imagePath原始={}, minioClient可用={}, "
+                                + "请检查：①iot-sink 是否挂载与算法相同的告警目录(如 /app/alert_images)；②MINIO_URL 能否访问 MinIO；③桶 alert-images 权限",
+                        alertId, imagePath, minioClient != null);
             }
 
             log.info("告警处理完成: alertId={}", alertId);

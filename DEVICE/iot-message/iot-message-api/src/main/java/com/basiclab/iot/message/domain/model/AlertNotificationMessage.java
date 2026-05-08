@@ -1,5 +1,6 @@
 package com.basiclab.iot.message.domain.model;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import lombok.Data;
 
 import java.util.List;
@@ -18,26 +19,31 @@ public class AlertNotificationMessage {
     /**
      * 告警ID
      */
+    @JsonAlias("alert_id")
     private Integer alertId;
     
     /**
      * 任务ID
      */
+    @JsonAlias("task_id")
     private Integer taskId;
     
     /**
      * 任务名称
      */
+    @JsonAlias("task_name")
     private String taskName;
     
     /**
      * 设备ID
      */
+    @JsonAlias("device_id")
     private String deviceId;
     
     /**
      * 设备名称
      */
+    @JsonAlias("device_name")
     private String deviceName;
     
     /**
@@ -108,11 +114,13 @@ public class AlertNotificationMessage {
         /**
          * 图片路径
          */
+        @JsonAlias("image_path")
         private String imagePath;
         
         /**
          * 录像路径
          */
+        @JsonAlias("record_path")
         private String recordPath;
         
         /**
@@ -123,6 +131,7 @@ public class AlertNotificationMessage {
         /**
          * 告警事件类型[realtime:实时算法任务,snap:抓拍算法任务]
          */
+        @JsonAlias("task_type")
         private String taskType;
     }
 }
