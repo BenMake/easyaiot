@@ -41,12 +41,21 @@
 | 变量 | 含义 | 默认 |
 |------|------|------|
 | `AI_RTSP_ASYNC_READ` | 对 **rtsp://**、**rtmp://** 是否启用异步拉流（后台解码线程） | `1`（启用） |
+| `AI_RTSP_ASYNC_QUEUE_MAX` | 异步侧缓冲帧数：`1` 只保留**最新一帧**（追实时，中间帧丢弃）；**大于 1** 时为 FIFO，主循环按序取帧，网络恢复后先消化队列，可减轻画面/OSD「停一下再跳几秒」 | `1` |
 
 关闭示例（恢复同步读，便于对比日志与行为）：
 
 ```bash
 AI_RTSP_ASYNC_READ=0
 ```
+
+缓解「恢复后抢实时、OSD 跳秒」示例（可按 CPU 与延迟容忍度调到 15～60）：
+
+```bash
+AI_RTSP_ASYNC_QUEUE_MAX=30
+```
+
+说明：队列有上限（代码侧最大 600 帧）；满时仍会从队首丢弃最旧帧，避免内存与端到端延迟无限增长。
 
 项目内可在以下模板/环境中找到同名字段（与 `env.example` 及 `VIDEO/.env*` 保持同步）：
 
@@ -55,7 +64,7 @@ AI_RTSP_ASYNC_READ=0
 
 ## 代码位置
 
-- **共享实现**：`VIDEO/app/utils/async_video_stream.py`（**`AsyncVideoStream`**、**`async_rtsp_read_enabled()`**，环境变量 **`AI_RTSP_ASYNC_READ`**）。
+- **共享实现**：`VIDEO/app/utils/async_video_stream.py`（**`AsyncVideoStream`**、**`async_rtsp_read_enabled()`**；环境变量 **`AI_RTSP_ASYNC_READ`**、**`AI_RTSP_ASYNC_QUEUE_MAX`**）。
 - **实时算法**：`VIDEO/services/realtime_algorithm_service/run_deploy.py` → `buffer_streamer_worker()`：打开 **RTSP/RTMP** 后按需包装异步对象；主循环区分 **`read_failed`** 与首帧等待（短睡眠）。
 - **推流转发**：`VIDEO/services/stream_forward_service/run_deploy.py` → 各设备读取器线程：逻辑同上（无实时算法的灰屏检测，但有读失败重试）。
 - **抓拍算法**：`VIDEO/services/snapshot_algorithm_service/run_deploy.py` → 抓拍缓流主循环：同上，并与原有 RTSP 灰屏重连逻辑共用 **`cap.release()`**。

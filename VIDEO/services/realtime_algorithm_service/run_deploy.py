@@ -1941,7 +1941,15 @@ def buffer_streamer_worker(device_id: str):
                     and (rtsp_url.startswith("rtsp://") or rtsp_url.startswith("rtmp://"))
                 ):
                     cap = AsyncVideoStream(cap).start()
-                    logger.info(f"📌 设备 {device_id} 已启用异步拉流（后台解码，主线程取最新帧；可设 AI_RTSP_ASYNC_READ=0 关闭）")
+                    _fifo = getattr(cap, "queue_max", 1)
+                    logger.info(
+                        f"📌 设备 {device_id} 已启用异步拉流（后台解码；AI_RTSP_ASYNC_READ=0 关闭）"
+                        + (
+                            f"，FIFO 缓冲 {_fifo} 帧（恢复后按序播、减轻 OSD 跳秒；AI_RTSP_ASYNC_QUEUE_MAX）"
+                            if _fifo > 1
+                            else "，仅保留最新帧（AI_RTSP_ASYNC_QUEUE_MAX=1）"
+                        )
+                    )
                 device_caps[device_id] = cap
                 logger.info(f"✅ 设备 {device_id} {stream_type} 流连接成功")
                 if rtsp_url.startswith("rtsp://"):

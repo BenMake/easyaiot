@@ -1773,8 +1773,14 @@ def buffer_streamer_worker(device_id: str):
                     and (rtsp_url.startswith("rtsp://") or rtsp_url.startswith("rtmp://"))
                 ):
                     cap = AsyncVideoStream(cap).start()
+                    _fifo = getattr(cap, "queue_max", 1)
                     logger.info(
                         f"📌 设备 {device_id} 已启用异步拉流（AI_RTSP_ASYNC_READ=0 可关闭）"
+                        + (
+                            f"，FIFO {_fifo} 帧（AI_RTSP_ASYNC_QUEUE_MAX）"
+                            if _fifo > 1
+                            else ""
+                        )
                     )
                 device_caps[device_id] = cap
                 logger.info(f"✅ 设备 {device_id} {stream_type} 流连接成功")
