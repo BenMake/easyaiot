@@ -2448,6 +2448,39 @@ def delete_model():
         return jsonify({'success': False, 'error': f'删除模型失败: {str(e)}'})
 
 
+def _dataset_api_base():
+    return (os.getenv('DATASET_API_BASE') or 'http://127.0.0.1:48080/admin-api').strip().rstrip('/')
+
+
+def _request_authorization():
+    auth = (request.headers.get('Authorization') or request.headers.get('X-Authorization') or '').strip()
+    if not auth:
+        auth = (os.getenv('DATASET_API_TOKEN') or '').strip()
+    if auth and not auth.lower().startswith('bearer '):
+        auth = 'Bearer ' + auth
+    return auth
+
+
+def _cloud_verify_ssl():
+    raw = os.getenv('DATASET_API_VERIFY_SSL', 'true').strip().lower()
+    return raw not in ('0', 'false', 'no', 'off')
+
+
+def _cloud_minio_config():
+    endpoint = (os.getenv('MINIO_ENDPOINT') or '').strip()
+    access_key = (os.getenv('MINIO_ACCESS_KEY') or '').strip()
+    secret_key = (os.getenv('MINIO_SECRET_KEY') or '').strip()
+    secure = os.getenv('MINIO_SECURE', 'false')
+    bucket = (os.getenv('MINIO_DATASETS_BUCKET') or 'datasets').strip()
+    return {
+        'endpoint': endpoint,
+        'access_key': access_key,
+        'secret_key': secret_key,
+        'secure': secure,
+        'bucket': bucket,
+    }
+
+
 def _cloud_auth_headers(authorization):
     h = {}
     if authorization:
@@ -2457,6 +2490,17 @@ def _cloud_auth_headers(authorization):
         if auth:
             h['Authorization'] = auth
     return h
+
+
+def _cloud_response_data(body):
+    if not isinstance(body, dict):
+        raise RuntimeError(f'云平台返回非 JSON 对象: {str(body)[:200]}')
+    if 'code' in body:
+        if body.get('code') != 0:
+            msg = body.get('msg') or body.get('message') or str(body)
+            raise RuntimeError(msg)
+        return body.get('data')
+    return body
 
 
 def _cloud_api_json(api_base, method, rel_path, authorization, params=None, json_body=None, timeout=180, verify_ssl=True):
@@ -2485,10 +2529,7 @@ def _cloud_api_json(api_base, method, rel_path, authorization, params=None, json
     except Exception:
         r.raise_for_status()
         raise RuntimeError(f'云平台返回非 JSON: HTTP {r.status_code} {r.text[:800]}')
-    if body.get('code') != 0:
-        msg = body.get('msg') or body.get('message') or str(body)
-        raise RuntimeError(msg)
-    return body.get('data')
+    return _cloud_response_data(body)
 
 
 def _parse_gateway_path_to_bucket_key(storage_path):
@@ -2644,6 +2685,61 @@ def _cloud_sync_file_for_slug(slug):
     return os.path.join(_dataset_slot_dir(slug), 'cloud_sync.json')
 
 
+CLOUD_DATASETS_ZIP_BUCKET = 'datasets'
+
+
+def _resolve_extracted_dataset_root(extract_dir):
+    """若 zip 内仅有一层目录，则以其为数据集根。"""
+    extract_dir = os.path.realpath(extract_dir)
+    if not os.path.isdir(extract_dir):
+        return extract_dir
+    entries = [e for e in os.listdir(extract_dir) if not e.startswith('.')]
+    if len(entries) == 1:
+        only = os.path.join(extract_dir, entries[0])
+        if os.path.isdir(only):
+            return only
+    return extract_dir
+
+
+def _ensure_cloud_dataset_zip_url(api_base, authorization, dataset_id, verify_ssl=True):
+    ds = _cloud_api_json(
+        api_base, 'GET', '/dataset/get', authorization,
+        params={'id': dataset_id}, verify_ssl=verify_ssl,
+    ) or {}
+    zip_url = (ds.get('zipUrl') or '').strip()
+    if zip_url:
+        return ds, zip_url
+    _cloud_api_json(
+        api_base, 'POST', f'/dataset/image/{dataset_id}/sync-to-minio',
+        authorization, verify_ssl=verify_ssl,
+    )
+    ds = _cloud_api_json(
+        api_base, 'GET', '/dataset/get', authorization,
+        params={'id': dataset_id}, verify_ssl=verify_ssl,
+    ) or {}
+    zip_url = (ds.get('zipUrl') or '').strip()
+    if not zip_url:
+        raise RuntimeError('云平台数据集尚未生成压缩包，请先在平台完成标注并同步到 MinIO')
+    return ds, zip_url
+
+
+def _download_cloud_zip_to_path(zip_url, dest_path, minio_cfg):
+    from minio_utils import download_object_to_path, get_minio_client
+
+    bucket, obj_key = _parse_gateway_path_to_bucket_key(zip_url)
+    if not obj_key:
+        raise RuntimeError(f'无法解析压缩包路径: {zip_url[:160]}')
+    if not bucket:
+        bucket = minio_cfg.get('bucket') or CLOUD_DATASETS_ZIP_BUCKET
+    mc = get_minio_client(
+        minio_cfg['endpoint'],
+        minio_cfg['access_key'],
+        minio_cfg['secret_key'],
+        minio_cfg['secure'],
+    )
+    download_object_to_path(mc, bucket, obj_key, dest_path)
+
+
 def _read_json_file(path, default):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -2652,160 +2748,158 @@ def _read_json_file(path, default):
         return default
 
 
+@app.route('/api/cloud/datasets', methods=['GET'])
+def cloud_list_datasets():
+    """列出 iot-dataset 平台数据集，供前端下拉选择。"""
+    api_base = _dataset_api_base()
+    authorization = _request_authorization()
+    verify_ssl = _cloud_verify_ssl()
+    try:
+        page_no = 1
+        page_size = 100
+        items = []
+        while page_no <= 50:
+            data = _cloud_api_json(
+                api_base, 'GET', '/dataset/page', authorization,
+                params={'pageNo': page_no, 'pageSize': page_size, 'datasetType': 0},
+                verify_ssl=verify_ssl,
+            ) or {}
+            if isinstance(data, list):
+                lst = data
+                total = len(lst)
+            else:
+                lst = data.get('list') or []
+                total = int(data.get('total') or 0)
+            for row in lst:
+                if not isinstance(row, dict):
+                    continue
+                did = row.get('id')
+                if did is None:
+                    continue
+                name = (row.get('name') or '').strip() or f'dataset_{did}'
+                version = (row.get('datasetCode') or '').strip()
+                label = f'{name} (ID:{did})'
+                if version:
+                    label = f'{name} [{version}] (ID:{did})'
+                items.append({
+                    'id': int(did),
+                    'name': name,
+                    'version': version,
+                    'label': label,
+                    'zipUrl': row.get('zipUrl') or '',
+                })
+            if len(lst) < page_size or (total and len(items) >= total):
+                break
+            page_no += 1
+        return jsonify({'datasets': items, 'api_base': api_base})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': f'获取云平台数据集列表失败: {e}'}), 400
+
+
 @app.route('/api/cloud/import', methods=['POST'])
 def cloud_import_dataset():
     """
-    从 EasyAIoT dataset 服务拉取数据集元数据与标注，并用 MinIO 下载原图到本地目录，
-    作为外部数据集槽位继续标注（与 iot-dataset-biz 行为对齐）。
+    从 iot-dataset 下载数据集压缩包到 uploads/，解压后解析为外部数据集槽位（static/annotations）。
     """
-    try:
-        from minio_utils import download_object_to_path, get_minio_client
-    except ImportError as e:
-        return jsonify({'error': f'缺少 minio 依赖或模块加载失败: {e}'}), 500
+    import zipfile
 
     data = request.get_json(silent=True) or {}
-    api_base = (data.get('api_base') or '').strip()
-    authorization = data.get('authorization') or data.get('token') or ''
     dataset_id = data.get('dataset_id')
-    minio_endpoint = (data.get('minio_endpoint') or '').strip()
-    minio_access_key = (data.get('minio_access_key') or '').strip()
-    minio_secret_key = (data.get('minio_secret_key') or '').strip()
-    minio_secure = bool(data.get('minio_secure', True))
-    minio_bucket_override = (data.get('minio_bucket') or '').strip()
-    verify_ssl = data.get('verify_ssl', True)
-    verify_ssl = False if verify_ssl is False else True
+    api_base = (data.get('api_base') or '').strip() or _dataset_api_base()
+    authorization = _request_authorization()
+    verify_ssl = _cloud_verify_ssl()
+    minio_cfg = _cloud_minio_config()
 
     try:
         dataset_id = int(dataset_id)
     except (TypeError, ValueError):
-        return jsonify({'error': 'dataset_id 必须为整数'}), 400
+        return jsonify({'error': '请选择有效的云平台数据集'}), 400
 
-    if not api_base:
-        return jsonify({'error': '请填写 api_base（含网关前缀，如 http://host/admin-api）'}), 400
-    if not minio_endpoint or not minio_access_key or not minio_secret_key:
-        return jsonify({'error': '请填写 minio_endpoint、minio_access_key、minio_secret_key'}), 400
+    if not minio_cfg['endpoint'] or not minio_cfg['access_key'] or not minio_cfg['secret_key']:
+        return jsonify({'error': '服务端未配置 MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY'}), 500
 
     try:
-        ds = _cloud_api_json(api_base, 'GET', '/dataset/get', authorization, params={'id': dataset_id}, verify_ssl=verify_ssl)
+        ds, zip_url = _ensure_cloud_dataset_zip_url(api_base, authorization, dataset_id, verify_ssl=verify_ssl)
     except Exception as e:
         traceback.print_exc()
-        return jsonify({'error': f'获取云平台数据集失败: {e}'}), 400
+        return jsonify({'error': f'获取云平台数据集压缩包失败: {e}'}), 400
 
     ds_name = (ds or {}).get('name') or f'dataset_{dataset_id}'
     safe = _sanitize_cloud_name(ds_name)
-    local_root = os.path.realpath(os.path.join(
-        app.config['UPLOAD_FOLDER'], 'cloud_sync', f'ds_{dataset_id}_{safe}'))
-    slug = _slug_from_import_root(local_root)
-
-    tag_rows = _cloud_fetch_all_pages(
-        api_base, '/dataset/tag/page', authorization, {'datasetId': dataset_id}, verify_ssl=verify_ssl)
-    tag_rows = sorted(tag_rows, key=lambda t: (t.get('shortcut') is None, t.get('shortcut') or 0))
-    shortcut_to_tag = {}
-    classes = []
-    for t in tag_rows:
-        sc = t.get('shortcut')
-        if sc is None:
-            continue
-        try:
-            sc = int(sc)
-        except (TypeError, ValueError):
-            continue
-        name = (t.get('name') or '').strip() or f'tag_{sc}'
-        color = t.get('color') or '#{:06x}'.format(hash(name) % 0x1000000)
-        shortcut_to_tag[sc] = {'name': name, 'color': color}
-        classes.append({'name': name, 'color': color})
-
-    img_rows = _cloud_fetch_all_pages(
-        api_base, '/dataset/image/page', authorization, {'datasetId': dataset_id}, verify_ssl=verify_ssl)
+    import_base = os.path.realpath(os.path.join(app.config['UPLOAD_FOLDER'], 'cloud_import', f'ds_{dataset_id}_{safe}'))
+    zip_path = os.path.join(import_base, f'dataset-{dataset_id}.zip')
+    extract_dir = os.path.join(import_base, 'data')
+    os.makedirs(import_base, exist_ok=True)
+    if os.path.isdir(extract_dir):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    os.makedirs(extract_dir, exist_ok=True)
 
     try:
-        mc = get_minio_client(minio_endpoint, minio_access_key, minio_secret_key, minio_secure)
-    except (RuntimeError, ValueError) as e:
-        return jsonify({'error': str(e)}), 400
+        _download_cloud_zip_to_path(zip_url, zip_path, minio_cfg)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': f'下载压缩包失败: {e}'}), 400
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile as e:
+        return jsonify({'error': f'压缩包损坏或格式无效: {e}'}), 400
+
+    dataset_root = _resolve_extracted_dataset_root(extract_dir)
+    slug = _slug_from_import_root(dataset_root)
+
+    out = _import_local_dataset_from_path(dataset_root, 'imagefolder')
+    if out.get('error'):
+        return jsonify({'error': out['error']}), 400
 
     _prepare_dataset_import_slot(slug)
-    os.makedirs(local_root, exist_ok=True)
-
-    annotations = {}
-    image_map = {}
-    errors = []
-    used_names = {}
-    resolved_bucket = minio_bucket_override
-
-    for row in img_rows:
-        iid = row.get('id')
-        name = (row.get('name') or f'img_{iid}.jpg').strip()
-        path = row.get('path') or ''
-        bkt, obj_key = _parse_gateway_path_to_bucket_key(path)
-        bucket = minio_bucket_override or bkt
-        if not bucket or not obj_key:
-            errors.append(f'图片 {iid} 无法解析 MinIO 路径: {path[:120]}')
-            continue
-        base_fn = os.path.basename(name) or os.path.basename(obj_key)
-        if base_fn in used_names:
-            stem, ext = os.path.splitext(base_fn)
-            base_fn = f'{stem}_{iid}{ext or ".jpg"}'
-        used_names[base_fn] = True
-        dst_abs = os.path.realpath(os.path.join(local_root, base_fn))
-        try:
-            download_object_to_path(mc, bucket, obj_key, dst_abs)
-        except Exception as e:
-            errors.append(f'{base_fn}: MinIO 下载失败 {e}')
-            continue
-        if not resolved_bucket:
-            resolved_bucket = bucket
-
-        try:
-            with Image.open(dst_abs) as im:
-                w, h = im.size
-        except Exception:
-            w, h = row.get('width'), row.get('heigh')
-
-        rel_key = _posix_relpath_under_root(local_root, dst_abs)
-        if not rel_key:
-            continue
-        ann_list = _cloud_annotations_to_auto_labeling(row.get('annotations'), shortcut_to_tag, w, h)
-        annotations[rel_key] = ann_list
-        image_map[rel_key] = {'id': iid, 'path': path}
-
-    if not annotations:
-        return jsonify({'error': '没有成功下载任何图片。' + ('; '.join(errors[:8]) if errors else '')}), 400
-
     cfg = {
         'mode': 'external',
-        'root': local_root,
+        'root': dataset_root,
         'cloud': {
             'api_base': api_base,
             'dataset_id': dataset_id,
-            'minio_endpoint': minio_endpoint,
-            'minio_bucket': resolved_bucket or minio_bucket_override or '',
-            'minio_secure': minio_secure,
+            'source_zip': zip_path,
         },
     }
     with open(_dataset_config_file_for_slug(slug), 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     with open(_classes_file_for_slug(slug), 'w', encoding='utf-8') as f:
-        json.dump(classes, f, indent=2, ensure_ascii=False)
+        json.dump(out['classes'], f, indent=2, ensure_ascii=False)
     with open(_annotations_file_for_slug(slug), 'w', encoding='utf-8') as f:
-        json.dump(annotations, f, indent=2, ensure_ascii=False)
+        json.dump(out['annotations'], f, indent=2, ensure_ascii=False)
     with open(_cloud_sync_file_for_slug(slug), 'w', encoding='utf-8') as f:
-        json.dump({'cloud_dataset_id': dataset_id, 'api_base': api_base, 'images': image_map}, f, indent=2, ensure_ascii=False)
+        json.dump({
+            'cloud_dataset_id': dataset_id,
+            'api_base': api_base,
+            'zip_path': zip_path,
+            'images': {},
+        }, f, indent=2, ensure_ascii=False)
     _write_active_file(slug)
 
+    hint = None
+    if out['labelme_images'] == 0 and out['coco_images'] == 0 and out['yolo_images'] == 0:
+        hint = '压缩包已解压，但未解析到 LabelMe / COCO / YOLO 标注，请确认 zip 内目录结构。'
+
     return jsonify({
-        'message': '已从云平台与 MinIO 导入到本地外部数据集',
+        'message': '已从云平台下载压缩包并导入本地数据集',
         'dataset_slug': slug,
-        'local_root': local_root,
-        'images_ok': len(annotations),
-        'errors': errors[:50],
+        'local_root': dataset_root,
+        'zip_path': zip_path,
+        'images_ok': len(out['image_keys']),
+        'yolo_images': out['yolo_images'],
+        'labelme_images': out['labelme_images'],
+        'coco_images': out['coco_images'],
+        'hint': hint,
     })
 
 
 @app.route('/api/cloud/export', methods=['POST'])
 def cloud_export_dataset():
     """
-    将当前槽位同步回云平台：更新/创建标签与图片记录，并通过 MinIO 上传新增图片。
-    若未绑定 cloud_dataset_id 且允许创建，则在云平台新建数据集。
+    在云平台新建数据集（名称 + 版本），并将当前槽位的标签、图片与标注同步上传。
     """
     try:
         from minio_utils import ensure_bucket, get_minio_client, image_content_type, upload_file_to_minio
@@ -2814,73 +2908,49 @@ def cloud_export_dataset():
 
     slug = _active_dataset_slug()
     data = request.get_json(silent=True) or {}
-    api_base = (data.get('api_base') or '').strip()
-    authorization = data.get('authorization') or data.get('token') or ''
-    minio_endpoint = (data.get('minio_endpoint') or '').strip()
-    minio_access_key = (data.get('minio_access_key') or '').strip()
-    minio_secret_key = (data.get('minio_secret_key') or '').strip()
-    minio_secure = bool(data.get('minio_secure', True))
-    minio_bucket = (data.get('minio_bucket') or '').strip()
-    verify_ssl = data.get('verify_ssl', True)
-    verify_ssl = False if verify_ssl is False else True
-    create_if_missing = data.get('create_if_missing', True)
-    cloud_ds_raw = data.get('cloud_dataset_id')
+    api_base = (data.get('api_base') or '').strip() or _dataset_api_base()
+    authorization = _request_authorization()
+    verify_ssl = _cloud_verify_ssl()
+    minio_cfg = _cloud_minio_config()
+    minio_endpoint = minio_cfg['endpoint']
+    minio_access_key = minio_cfg['access_key']
+    minio_secret_key = minio_cfg['secret_key']
+    minio_secure = minio_cfg['secure']
+    minio_bucket = (os.getenv('MINIO_BUCKET') or 'dataset').strip()
+
+    ds_name = (data.get('name') or data.get('dataset_name') or '').strip()
+    ds_version = (data.get('version') or data.get('dataset_code') or '').strip()
+    if not ds_name:
+        return jsonify({'error': '请填写数据集名称'}), 400
+    if not ds_version:
+        return jsonify({'error': '请填写版本'}), 400
+
+    if not minio_endpoint or not minio_access_key or not minio_secret_key:
+        return jsonify({'error': '服务端未配置 MinIO 连接信息'}), 500
 
     sync_path = _cloud_sync_file_for_slug(slug)
-    sync = _read_json_file(sync_path, {})
+    sync = {}
     slot_cfg = _read_json_file(_dataset_config_file_for_slug(slug), {})
     cloud_hint = (slot_cfg.get('cloud') or {}) if isinstance(slot_cfg, dict) else {}
 
-    if not api_base:
-        api_base = (cloud_hint.get('api_base') or sync.get('api_base') or '').strip()
-    if not minio_bucket:
-        minio_bucket = (cloud_hint.get('minio_bucket') or '').strip()
-
-    if not api_base:
-        return jsonify({'error': '请填写 api_base，或先执行云平台导入以保存默认地址'}), 400
-    if not authorization:
-        return jsonify({'error': '请填写 authorization（Bearer Token）'}), 400
-    if not minio_endpoint or not minio_access_key or not minio_secret_key or not minio_bucket:
-        return jsonify({'error': '请填写 MinIO endpoint、密钥与 bucket'}), 400
-
-    cloud_dataset_id = None
-    if cloud_ds_raw is not None and str(cloud_ds_raw).strip() != '':
-        try:
-            cloud_dataset_id = int(cloud_ds_raw)
-        except (TypeError, ValueError):
-            return jsonify({'error': 'cloud_dataset_id 无效'}), 400
-    else:
-        try:
-            cloud_dataset_id = int(sync.get('cloud_dataset_id'))
-        except (TypeError, ValueError):
-            cloud_dataset_id = None
-
     try:
-        if cloud_dataset_id is None:
-            if not create_if_missing:
-                return jsonify({'error': '未绑定云平台数据集 ID，且未允许自动创建'}), 400
-            ds_title = slug
-            new_id = _cloud_api_json(
-                api_base, 'POST', '/dataset/create', authorization,
-                json_body={
-                    'name': ds_title,
-                    'datasetType': 0,
-                    'description': '自动标注平台 标注工具同步创建',
-                },
-                verify_ssl=verify_ssl,
-            )
-            try:
-                cloud_dataset_id = int(new_id)
-            except (TypeError, ValueError):
-                return jsonify({'error': f'创建数据集返回异常: {new_id}'}), 500
-        else:
-            _cloud_api_json(
-                api_base, 'GET', '/dataset/get', authorization,
-                params={'id': cloud_dataset_id}, verify_ssl=verify_ssl,
-            )
+        new_id = _cloud_api_json(
+            api_base, 'POST', '/dataset/create', authorization,
+            json_body={
+                'name': ds_name,
+                'datasetCode': ds_version,
+                'datasetType': 0,
+                'description': f'自动标注平台导出（本地槽位: {slug}）',
+            },
+            verify_ssl=verify_ssl,
+        )
+        try:
+            cloud_dataset_id = int(new_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': f'创建数据集返回异常: {new_id}'}), 500
     except Exception as e:
         traceback.print_exc()
-        return jsonify({'error': f'校验/创建云平台数据集失败: {e}'}), 400
+        return jsonify({'error': f'创建云平台数据集失败: {e}'}), 400
 
     classes = _read_json_file(_classes_file_for_slug(slug), [])
     if not isinstance(classes, list):
@@ -3073,8 +3143,10 @@ def cloud_export_dataset():
             pass
 
     return jsonify({
-        'message': '已同步到云平台',
+        'message': '已创建云平台数据集并同步标注',
         'cloud_dataset_id': cloud_dataset_id,
+        'name': ds_name,
+        'version': ds_version,
         'updated_images': updated,
         'created_images': created,
         'errors': err[:40],

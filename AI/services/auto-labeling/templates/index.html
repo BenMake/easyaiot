@@ -141,6 +141,12 @@
         <div class="modal-content export-modal-content">
             <span class="close">&times;</span>
             <h2><i class="fas fa-download"></i> 导出数据集</h2>
+            <div class="dataset-tabs">
+                <button type="button" class="tab-btn active" data-tab="export-local">导出到本地</button>
+                <button type="button" class="tab-btn" data-tab="export-cloud">云平台</button>
+            </div>
+            <div class="tab-content">
+                <div class="tab-pane active" id="export-local-tab">
             <form id="exportForm">
                 <div class="form-row">
                     <div class="form-group">
@@ -196,42 +202,29 @@
                     </div>
                 </div>
             </form>
-            <hr style="margin:20px 0;border:none;border-top:1px solid #e0e0e0;">
-            <h3 style="margin:0 0 12px;font-size:1.05em;"><i class="fas fa-cloud-upload-alt"></i> 导出到云平台（MinIO + 数据集服务）</h3>
-            <p style="color:#666;font-size:0.88em;margin:0 0 12px;">将当前数据集的类别与图片标注写回云平台：已绑定图片则 <code>PUT /dataset/image/update</code>；新图片则上传 MinIO 并 <code>POST /dataset/image/create</code>。若本地未绑定数据集 ID 且勾选允许创建，将自动 <code>POST /dataset/create</code>。</p>
-            <div class="form-group">
-                <label for="cloudExportApiBase">API 根地址</label>
-                <input type="text" id="cloudExportApiBase" class="form-control" placeholder="默认可从上次导入的 dataset_config 读取" style="width:100%;box-sizing:border-box;">
+                </div>
+                <div class="tab-pane" id="export-cloud-tab">
+                    <div class="upload-area" id="cloudExportArea" style="text-align: left;">
+                        <p style="color:#555;font-size:0.9em;">将当前标注结果同步为云平台上的<strong>新数据集</strong>（自动创建并上传图片与标注）。连接信息由服务端环境变量配置。</p>
+                        <div class="form-row" style="display:flex;gap:16px;flex-wrap:wrap;">
+                            <div class="form-group" style="flex:1;min-width:200px;">
+                                <label for="cloudExportName">数据集名称</label>
+                                <input type="text" id="cloudExportName" class="form-control" placeholder="例如：行人检测-2026" style="width:100%;box-sizing:border-box;">
+                            </div>
+                            <div class="form-group" style="flex:1;min-width:160px;">
+                                <label for="cloudExportVersion">版本</label>
+                                <input type="text" id="cloudExportVersion" class="form-control" placeholder="例如：v1.0.0" style="width:100%;box-sizing:border-box;">
+                            </div>
+                        </div>
+                        <div class="upload-actions" style="margin-top:15px;text-align:center;">
+                            <button type="button" class="btn btn-primary" id="cloudExportBtn">
+                                <i class="fas fa-cloud-upload-alt"></i> 导出到云平台
+                            </button>
+                        </div>
+                        <div id="cloudExportStatus" style="margin-top:10px;font-size:0.9em;color:#444;"></div>
+                    </div>
+                </div>
             </div>
-            <div class="form-group">
-                <label for="cloudExportToken">Authorization（必填）</label>
-                <input type="password" id="cloudExportToken" class="form-control" placeholder="Bearer ..." style="width:100%;box-sizing:border-box;">
-            </div>
-            <div class="form-group">
-                <label for="cloudExportDatasetId">云平台数据集 ID（可选，默认可从 cloud_sync.json）</label>
-                <input type="number" id="cloudExportDatasetId" class="form-control" placeholder="留空则自动创建或沿用已绑定 ID">
-            </div>
-            <div class="form-group">
-                <label for="cloudExportMinioEp">MinIO Endpoint</label>
-                <input type="text" id="cloudExportMinioEp" class="form-control" placeholder="minio:9000">
-            </div>
-            <div class="form-group" style="display:flex;gap:12px;flex-wrap:wrap;">
-                <label style="flex:1;">Access Key<input type="text" id="cloudExportMinioAk" class="form-control"></label>
-                <label style="flex:1;">Secret Key<input type="password" id="cloudExportMinioSk" class="form-control"></label>
-            </div>
-            <div class="form-group">
-                <label for="cloudExportBucket">Bucket（必填，须与平台配置一致）</label>
-                <input type="text" id="cloudExportBucket" class="form-control" placeholder="dataset">
-            </div>
-            <div class="form-group">
-                <label><input type="checkbox" id="cloudExportMinioSecure" checked> MinIO HTTPS</label>
-                <label style="margin-left:16px;"><input type="checkbox" id="cloudExportVerifySsl" checked> 校验 TLS</label>
-                <label style="margin-left:16px;"><input type="checkbox" id="cloudExportCreateDs" checked> 无绑定 ID 时自动创建数据集</label>
-            </div>
-            <button type="button" class="btn btn-primary" id="cloudExportBtn" style="margin-top:4px;">
-                <i class="fas fa-sync"></i> 同步到云平台
-            </button>
-            <div id="cloudExportStatus" style="margin-top:10px;font-size:0.9em;color:#444;"></div>
         </div>
     </div>
 
@@ -325,23 +318,6 @@
             <h2><i class="fas fa-cog"></i> 设置</h2>
             
             <div class="settings-accordion">
-                <!-- 关于项目 - 默认折叠 -->
-                <div class="accordion-item">
-                    <div class="accordion-header" onclick="toggleAccordion(this)">
-                        <span><i class="fas fa-user"></i> 关于项目</span>
-                        <i class="fas fa-chevron-down accordion-icon"></i>
-                    </div>
-                    <div class="accordion-body">
-                        <div class="info-row">
-                            <span><strong>作者:</strong> 自动标注平台</span>
-                            <span><strong>版本:</strong> v1.0</span>
-                        </div>
-                        <div><strong>基于:</strong> <a href="https://github.com/beixiaocai/xclabel" target="_blank">xclabel v2.1 (MIT协议)</a></div>
-                        <div style="margin-top: 8px;"><strong>友情推广:</strong> <a href="https://gitee.com/volara/easyaiot" target="_blank">EasyAIoT（云边端一体化智能算法应用平台）</a></div>
-                    </div>
-                </div>
-                
-                <!-- YOLO11安装 - 默认展开 -->
                 <div class="accordion-item active">
                     <div class="accordion-header" onclick="toggleAccordion(this)">
                         <span><i class="fas fa-robot"></i> YOLO11 模型管理</span>
@@ -565,37 +541,15 @@ uploads/
                         </div>
                     </div>
                 </div>
-                <!-- 云平台：API + MinIO -->
+                <!-- 云平台：选择数据集并下载压缩包 -->
                 <div class="tab-pane" id="cloud-tab">
                     <div class="upload-area" id="cloudImportArea" style="text-align: left;">
-                        <p style="color:#555;font-size:0.9em;">通过数据集服务分页接口拉取图片与标注，并用 MinIO 下载原图到 <code>uploads/cloud_sync/</code>，作为外部数据集继续标注（对象键与 iot-dataset-biz 中 <code>prefix=</code> 一致）。</p>
+                        <p style="color:#555;font-size:0.9em;">从云平台数据集服务选择数据集，下载压缩包到 <code>uploads/</code> 并解析生成 <code>static/annotations</code> 标注槽位。连接信息由服务端环境变量配置。</p>
                         <div class="form-group">
-                            <label for="cloudApiBase">API 根地址（含网关前缀）</label>
-                            <input type="text" id="cloudApiBase" class="form-control" placeholder="http://host:48080/admin-api" autocomplete="off" style="width:100%;box-sizing:border-box;">
-                        </div>
-                        <div class="form-group">
-                            <label for="cloudToken">Authorization（Bearer Token）</label>
-                            <input type="password" id="cloudToken" class="form-control" placeholder="Bearer ..." autocomplete="off" style="width:100%;box-sizing:border-box;">
-                        </div>
-                        <div class="form-group">
-                            <label for="cloudDatasetId">云平台数据集 ID</label>
-                            <input type="number" id="cloudDatasetId" class="form-control" placeholder="例如 1569" style="width:100%;box-sizing:border-box;">
-                        </div>
-                        <div class="form-group">
-                            <label for="cloudMinioEndpoint">MinIO Endpoint（不含 http/https）</label>
-                            <input type="text" id="cloudMinioEndpoint" class="form-control" placeholder="minio:9000" style="width:100%;box-sizing:border-box;">
-                        </div>
-                        <div class="form-group" style="display:flex;gap:12px;flex-wrap:wrap;">
-                            <label style="flex:1;min-width:140px;">Access Key<input type="text" id="cloudMinioAk" class="form-control" autocomplete="off"></label>
-                            <label style="flex:1;min-width:140px;">Secret Key<input type="password" id="cloudMinioSk" class="form-control" autocomplete="off"></label>
-                        </div>
-                        <div class="form-group">
-                            <label for="cloudMinioBucket">Bucket（可选，可从图片 path 自动解析）</label>
-                            <input type="text" id="cloudMinioBucket" class="form-control" placeholder="dataset" style="width:100%;box-sizing:border-box;">
-                        </div>
-                        <div class="form-group">
-                            <label><input type="checkbox" id="cloudMinioSecure" checked> MinIO 使用 HTTPS</label>
-                            <label style="margin-left:16px;"><input type="checkbox" id="cloudVerifySsl" checked> 校验 TLS 证书</label>
+                            <label for="cloudDatasetSelect">选择数据集</label>
+                            <select id="cloudDatasetSelect" class="form-control" style="width:100%;box-sizing:border-box;">
+                                <option value="">加载中…</option>
+                            </select>
                         </div>
                         <div class="upload-actions" style="margin-top:15px;text-align:center;">
                             <button type="button" id="cloudImportBtn" class="btn btn-success">
