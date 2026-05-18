@@ -154,14 +154,89 @@ async function ensureDatasetUrlMap() {
   }
 }
 
-function enrichDatasetDisplay(records: Record<string, unknown>[]) {
+const LEGACY_TIMESTAMP_BASE = /^train_task_\d{8}_\d{6}$/;
+
+function resolveTaskBaseName(record: Record<string, unknown>) {
+  try {
+    const raw = record.hyperparameters;
+    const hp = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    for (const key of ['task_base_name', 'taskName', 'task_name']) {
+      const val = String(hp?.[key] || '').trim();
+      if (val) return val;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  let base = String(record.name || record.task_name || '').trim();
+  const taskId = record.id as number | undefined;
+  if (taskId != null && base.endsWith(`_${taskId}`)) {
+    base = base.slice(0, -(`_${taskId}`).length);
+  }
+  const dsName = String(record.dataset_name || '').trim();
+  const dsVersion = String(record.dataset_version || '').trim();
+  for (const part of [dsVersion, dsName]) {
+    if (part && base.endsWith(`_${part}`)) {
+      base = base.slice(0, -(part.length + 1));
+    }
+  }
+  if (LEGACY_TIMESTAMP_BASE.test(base) || base.startsWith('train_task_')) {
+    return 'train';
+  }
+  return base || 'train';
+}
+
+function buildTrainTaskDisplayName(
+  baseName: string,
+  datasetName?: string,
+  datasetVersion?: string,
+  taskId?: number,
+) {
+  let base = (baseName || '').trim();
+  if (LEGACY_TIMESTAMP_BASE.test(base) || base.startsWith('train_task_')) {
+    base = 'train';
+  }
+  if (!base) base = 'train';
+
+  const parts = [base];
+  const dsName = (datasetName || '').trim();
+  const dsVersion = (datasetVersion || '').trim();
+  if (dsName) parts.push(dsName);
+  if (dsVersion) parts.push(dsVersion);
+  if (taskId != null) parts.push(String(taskId));
+  return parts.join('_');
+}
+
+function enrichTrainTaskRecords(records: Record<string, unknown>[]) {
   if (!records?.length) return;
   for (const record of records) {
-    if (record.dataset_name) continue;
-    const matched = datasetUrlMap?.[record.dataset_path as string];
-    if (matched?.name) {
-      record.dataset_name = matched.name;
-      record.dataset_version = matched.version;
+    if (!record.dataset_name) {
+      const matched = datasetUrlMap?.[record.dataset_path as string];
+      if (matched?.name) {
+        record.dataset_name = matched.name;
+        record.dataset_version = matched.version;
+      }
+    }
+
+    const displayName = (record.name as string) || '';
+    const taskId = record.id as number;
+    const dsName = (record.dataset_name as string) || '';
+    const dsVersion = (record.dataset_version as string) || '';
+    const expectedName = buildTrainTaskDisplayName(
+      resolveTaskBaseName(record),
+      dsName,
+      dsVersion,
+      taskId,
+    );
+    const needsRename =
+      !displayName ||
+      displayName.includes('训练任务') ||
+      displayName === '未命名任务' ||
+      displayName.startsWith('train_task_') ||
+      displayName !== expectedName;
+
+    if (needsRename) {
+      record.name = expectedName;
     }
   }
 }
@@ -180,8 +255,8 @@ function buildRequestParams(params: Record<string, unknown>) {
   if (requestParams.task_name === '') {
     delete requestParams.task_name;
   }
-  if (requestParams.status === '') {
-    delete requestParams.status;
+  if (requestParams.progress_filter === '') {
+    delete requestParams.progress_filter;
   }
   return requestParams;
 }
@@ -191,7 +266,7 @@ async function fetchTrainTasks(params: Record<string, unknown>) {
   const result = await getTrainTaskPage(buildRequestParams(params));
   const records = result?.data ?? result?.list ?? [];
   if (Array.isArray(records)) {
-    enrichDatasetDisplay(records);
+    enrichTrainTaskRecords(records);
   }
   return result;
 }

@@ -107,16 +107,15 @@ export function getFormConfig(): Partial<FormProps> {
         component: 'Input',
       },
       {
-        field: 'status',
-        label: '状态',
+        field: 'progress_filter',
+        label: '训练进度',
         component: 'Select',
         componentProps: {
           options: [
             {label: '全部', value: ''},
-            {label: '运行中', value: 'running'},
-            {label: '已完成', value: 'completed'},
-            {label: '失败', value: 'failed'},
-            {label: '已停止', value: 'stopped'},
+            {label: '未开始 (0%)', value: 'not_started'},
+            {label: '进行中 (1-99%)', value: 'in_progress'},
+            {label: '已完成 (100%)', value: 'completed'},
           ],
         },
       },

@@ -23,7 +23,7 @@
             <ListItem :class="getItemClass(item)">
               <div class="task-info">
                 <div class="status" :style="getStatusBadgeStyle(item)">{{ getStatusText(item) }}</div>
-                <div class="title o2" :title="item.name">{{ item.name || '未命名任务' }}</div>
+                <div class="title o2" :title="item.name">{{ item.name || 'train' }}</div>
                 <div class="props">
                   <div class="flex" style="justify-content: space-between;">
                     <div class="prop">

@@ -41,7 +41,7 @@ class Model(db.Model):
 
 class TrainTask(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=True)
+    name = db.Column(db.String(200), nullable=True)
     model_id = db.Column(db.Integer, nullable=True)  # 已废弃，保留列兼容历史数据
     progress = db.Column(db.Integer, default=0)
     dataset_path = db.Column(db.String(200), nullable=False)

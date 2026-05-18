@@ -15,6 +15,7 @@ import torch
 from flask import current_app, jsonify, Blueprint, request
 from ultralytics import YOLO
 
+from app.blueprints.train_task import build_train_task_name, resolve_task_base_name
 from app.services.minio_service import ModelService
 from db_models import db, TrainTask
 
@@ -23,6 +24,25 @@ train_bp = Blueprint('train', __name__)
 # 全局训练状态和进程
 train_status = {}
 train_processes = {}
+
+
+def _build_train_hyperparameters(
+    epochs,
+    model_arch,
+    img_size,
+    batch_size,
+    use_gpu,
+    task_base_name,
+):
+    base = (task_base_name or 'train').strip() or 'train'
+    return json.dumps({
+        'epochs': epochs,
+        'model_arch': model_arch,
+        'img_size': img_size,
+        'batch_size': batch_size,
+        'use_gpu': use_gpu,
+        'task_base_name': base,
+    })
 
 @train_bp.route('/start', methods=['POST'])
 def api_start_train():
@@ -52,48 +72,48 @@ def api_start_train():
             if train_task:
                 if train_task.id in train_status and train_status[train_task.id]['status'] in ['preparing', 'train']:
                     return jsonify({'success': False, 'code': 0, 'msg': '该训练任务已在进行中'}), 200
-                if task_name:
-                    train_task.name = task_name
                 train_task.dataset_path = dataset_zip_path
                 if dataset_name:
                     train_task.dataset_name = dataset_name
                 if dataset_version is not None:
                     train_task.dataset_version = dataset_version
+                task_base_name = task_name or resolve_task_base_name(train_task)
                 train_task.start_time = datetime.utcnow()
                 train_task.status = 'preparing'
                 train_task.train_log = ''
                 train_task.progress = 0
-                train_task.hyperparameters = json.dumps({
-                    'epochs': epochs,
-                    'model_arch': model_arch,
-                    'img_size': img_size,
-                    'batch_size': batch_size,
-                    'use_gpu': use_gpu
-                })
+                train_task.hyperparameters = _build_train_hyperparameters(
+                    epochs, model_arch, img_size, batch_size, use_gpu, task_base_name
+                )
+                train_task.name = build_train_task_name(
+                    task_base_name,
+                    train_task.dataset_name,
+                    train_task.dataset_version,
+                    train_task.id,
+                )
                 db.session.commit()
                 is_new_record = False
 
         if not train_task:
-            if not task_name:
-                task_name = f'训练任务_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            task_base_name = task_name or 'train'
             train_task = TrainTask(
-                name=task_name,
+                name='',
                 dataset_path=dataset_zip_path,
                 dataset_name=dataset_name,
                 dataset_version=dataset_version,
-                hyperparameters=json.dumps({
-                    'epochs': epochs,
-                    'model_arch': model_arch,
-                    'img_size': img_size,
-                    'batch_size': batch_size,
-                    'use_gpu': use_gpu
-                }),
+                hyperparameters=_build_train_hyperparameters(
+                    epochs, model_arch, img_size, batch_size, use_gpu, task_base_name
+                ),
                 start_time=datetime.utcnow(),
                 status='preparing',
                 train_log='',
                 checkpoint_dir=''
             )
             db.session.add(train_task)
+            db.session.flush()
+            train_task.name = build_train_task_name(
+                task_base_name, dataset_name, dataset_version, train_task.id
+            )
             db.session.commit()
             is_new_record = True
 
