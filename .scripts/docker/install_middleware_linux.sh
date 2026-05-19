@@ -47,6 +47,11 @@ BIGDATA_FLINK_SQL_DIR="${SCRIPT_DIR}/../flink"
 BIGDATA_FLINK_DWD_SQL_LOCAL="${BIGDATA_FLINK_SQL_DIR}/01_dwd_attribution_job.local.sql"
 BIGDATA_FLINK_DWS_ADS_SQL_LOCAL="${BIGDATA_FLINK_SQL_DIR}/02_dws_ads_session_job.local.sql"
 
+# GPUStack Worker（本机算力节点，与 compose 中的 gpustack-server 配合）
+GPUSTACK_WORKER_NAME="${GPUSTACK_WORKER_NAME:-gpustack-worker}"
+GPUSTACK_WORKER_IMAGE="${GPUSTACK_WORKER_IMAGE:-quay.io/gpustack/gpustack:v2.1.2}"
+GPUSTACK_TOKEN="${GPUSTACK_TOKEN:-gpustack_70d21b253802d295_3d02018bab52e4df1249cd72cb77acf3}"
+
 # 日志文件配置
 LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$LOG_DIR"
@@ -2495,6 +2500,118 @@ prepare_gpustack_env() {
     else
         export GPUSTACK_SERVER_EXTERNAL_URL="http://${host_ip}:10180"
         print_info "GPUStack 对外地址: $GPUSTACK_SERVER_EXTERNAL_URL"
+    fi
+}
+
+# 执行 docker 命令（优先当前用户，必要时使用 sudo）
+docker_cli() {
+    if docker "$@" 2>/dev/null; then
+        return 0
+    fi
+    if command -v sudo &>/dev/null; then
+        sudo docker "$@"
+        return $?
+    fi
+    docker "$@"
+}
+
+# 等待 GPUStack Server 就绪
+wait_for_gpustack_server() {
+    local max_attempts=60
+    local attempt=0
+    local check_url="http://127.0.0.1:10180/"
+
+    print_info "等待 GPUStack Server 就绪..."
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        if curl -sf "$check_url" >/dev/null 2>&1; then
+            print_success "GPUStack Server 已就绪"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+
+    print_warning "GPUStack Server 未在预期时间内就绪，仍将尝试部署 Worker"
+    return 1
+}
+
+# 部署 GPUStack Worker（检测 GPU 后选择是否启用 NVIDIA runtime）
+deploy_gpustack_worker() {
+    print_section "部署 GPUStack Worker"
+
+    if ! docker_cli ps &>/dev/null; then
+        print_error "无法访问 Docker，跳过 GPUStack Worker 部署"
+        return 1
+    fi
+
+    local host_ip
+    host_ip=$(get_host_ip)
+    if [ -z "$host_ip" ]; then
+        print_warning "无法获取宿主机 IP，Worker 将使用 127.0.0.1"
+        host_ip="127.0.0.1"
+    else
+        print_info "检测到宿主机 IP: $host_ip"
+    fi
+
+    local server_url="http://${host_ip}:10180"
+    local worker_ip="$host_ip"
+
+    if docker_cli image inspect "$GPUSTACK_WORKER_IMAGE" &>/dev/null; then
+        print_info "GPUStack Worker 镜像已存在: $GPUSTACK_WORKER_IMAGE"
+    else
+        print_info "拉取 GPUStack Worker 镜像: $GPUSTACK_WORKER_IMAGE"
+        if ! docker_cli pull "$GPUSTACK_WORKER_IMAGE" 2>&1 | tee -a "$LOG_FILE"; then
+            print_error "拉取 GPUStack Worker 镜像失败"
+            return 1
+        fi
+    fi
+
+    if docker_cli ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$GPUSTACK_WORKER_NAME"; then
+        print_info "移除已有容器: $GPUSTACK_WORKER_NAME"
+        docker_cli rm -f "$GPUSTACK_WORKER_NAME" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+
+    local -a run_args=(
+        run -d
+        --name "$GPUSTACK_WORKER_NAME"
+        -e "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME=gpustack-worker"
+        -e "GPUSTACK_TOKEN=${GPUSTACK_TOKEN}"
+        --restart=unless-stopped
+        --privileged
+        --network=host
+        --volume /var/run/docker.sock:/var/run/docker.sock
+        --volume gpustack-data:/var/lib/gpustack
+    )
+
+    if check_nvidia_gpu_support; then
+        print_info "检测到 NVIDIA GPU，使用 NVIDIA runtime 启动 Worker"
+        run_args+=(--runtime nvidia)
+    else
+        print_info "未检测到 NVIDIA GPU，以 CPU 模式启动 Worker"
+    fi
+
+    run_args+=(
+        "$GPUSTACK_WORKER_IMAGE"
+        --server-url "$server_url"
+        --worker-ip "$worker_ip"
+    )
+
+    print_info "启动 GPUStack Worker: server-url=$server_url, worker-ip=$worker_ip"
+    if docker_cli "${run_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+        print_success "GPUStack Worker 已启动: $GPUSTACK_WORKER_NAME"
+        print_info "查看日志: docker logs -f $GPUSTACK_WORKER_NAME"
+        return 0
+    fi
+
+    print_error "GPUStack Worker 启动失败"
+    return 1
+}
+
+# 停止 GPUStack Worker
+stop_gpustack_worker() {
+    if docker_cli ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$GPUSTACK_WORKER_NAME"; then
+        print_info "停止 GPUStack Worker: $GPUSTACK_WORKER_NAME"
+        docker_cli stop "$GPUSTACK_WORKER_NAME" 2>&1 | tee -a "$LOG_FILE" || true
     fi
 }
 
@@ -5138,7 +5255,7 @@ cleanup_stale_containers() {
     done
     
     # 检查是否有停止的容器需要清理
-    local stale_containers=$(docker ps -a --filter "status=exited" --format "{{.Names}}" 2>/dev/null | grep -E "(nacos-server|postgres-server|tdengine-server|redis-server|kafka-server|minio-server|milvus-server|srs-server|nodered-server|emqx-server|zlmediakit-server|flink-jobmanager|flink-taskmanager|doris-fe-server|doris-be-server|gpustack-server)" || echo "")
+    local stale_containers=$(docker ps -a --filter "status=exited" --format "{{.Names}}" 2>/dev/null | grep -E "(nacos-server|postgres-server|tdengine-server|redis-server|kafka-server|minio-server|milvus-server|srs-server|nodered-server|emqx-server|zlmediakit-server|flink-jobmanager|flink-taskmanager|doris-fe-server|doris-be-server|gpustack-server|gpustack-worker)" || echo "")
     
     if [ -n "$stale_containers" ]; then
         print_info "发现残留的停止容器，正在清理..."
@@ -5271,6 +5388,11 @@ install_middleware() {
         done
         echo ""
     fi
+
+    # 部署 GPUStack Worker（本机算力节点）
+    echo ""
+    wait_for_gpustack_server || true
+    deploy_gpustack_worker || print_warning "GPUStack Worker 部署失败，可稍后手动执行 deploy_gpustack_worker 相关命令"
     
     print_success "中间件安装完成"
     echo ""
@@ -5370,6 +5492,11 @@ start_middleware() {
     configure_postgresql_max_connections
 
     print_info "如需一键初始化 Flink + Doris 人车链路，请执行: ./install_middleware_linux.sh init-bigdata"
+
+    # 部署 GPUStack Worker（本机算力节点）
+    echo ""
+    wait_for_gpustack_server || true
+    deploy_gpustack_worker || print_warning "GPUStack Worker 部署失败"
     
     sleep 5
     bash "${SCRIPT_DIR}/set_permanent_token.sh" >/dev/null 2>&1 || true
@@ -5384,6 +5511,7 @@ stop_middleware() {
     check_compose_file
     
     print_info "停止所有中间件服务..."
+    stop_gpustack_worker
     $COMPOSE_CMD -f "$COMPOSE_FILE" down 2>&1 | tee -a "$LOG_FILE"
     
     print_success "所有中间件已停止"
@@ -5440,6 +5568,11 @@ restart_middleware() {
     configure_postgresql_max_connections
 
     print_info "如需一键初始化 Flink + Doris 人车链路，请执行: ./install_middleware_linux.sh init-bigdata"
+
+    # 重新部署 GPUStack Worker
+    echo ""
+    wait_for_gpustack_server || true
+    deploy_gpustack_worker || print_warning "GPUStack Worker 部署失败"
     
     sleep 5
     bash "${SCRIPT_DIR}/set_permanent_token.sh" >/dev/null 2>&1 || true
@@ -5599,6 +5732,12 @@ clean_middleware() {
         if [ -n "$zlmediakit_containers" ]; then
             print_warning "发现 ZLMediaKit 残留容器，正在强制删除..."
             echo "$zlmediakit_containers" | xargs -r docker rm -f 2>&1 | tee -a "$LOG_FILE"
+        fi
+
+        # 删除 GPUStack Worker（独立容器，不在 compose 中）
+        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$GPUSTACK_WORKER_NAME"; then
+            print_info "删除 GPUStack Worker 容器: $GPUSTACK_WORKER_NAME"
+            docker_cli rm -f "$GPUSTACK_WORKER_NAME" 2>&1 | tee -a "$LOG_FILE" || true
         fi
         
         # 第五步：删除所有 bind mount 的宿主机存储目录
@@ -5764,6 +5903,11 @@ update_middleware() {
     sleep 10
 
     print_info "如需一键初始化 Flink + Doris 人车链路，请执行: ./install_middleware_linux.sh init-bigdata"
+
+    # 部署 GPUStack Worker（本机算力节点）
+    echo ""
+    wait_for_gpustack_server || true
+    deploy_gpustack_worker || print_warning "GPUStack Worker 部署失败"
 }
 
 # 显示帮助信息
