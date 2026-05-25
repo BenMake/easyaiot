@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.4
-# Maven 本地仓库挂载宿主机 .build-cache/m2/repository（由 install_linux.sh 预创建）
+# 备用：单 Dockerfile 多 target 一体构建（日常请用 Dockerfile.base + 各模块 Dockerfile，见 install_linux.sh）
 FROM maven:3.9.11-eclipse-temurin-21-alpine AS builder
 
 RUN mkdir -p /m2/repository && \

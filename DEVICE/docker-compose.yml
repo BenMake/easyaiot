@@ -1,6 +1,5 @@
-# 构建期依赖缓存（运行时无需挂载）：
-#   .build-cache/m2/repository — Maven dependency:go-offline / package 时 bind mount
-#   默认属主 UID/GID=1000
+# 构建：install_linux.sh 两阶段（Dockerfile.base 一次 Maven → target/jars → 各模块 Dockerfile）
+# Maven 依赖缓存：.build-cache/m2/repository
 services:
   iot-gateway:
     image: iot-gateway:latest

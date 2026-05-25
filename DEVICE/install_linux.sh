@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # DEVICE模块 Docker Compose 管理脚本
-# 用于管理DEVICE目录下的所有Docker服务
-# 使用统一的多阶段构建 Dockerfile
+# 两阶段构建：Dockerfile.base（Maven 一次）→ target/jars → 各模块运行时 Dockerfile
 
 set -e
 
@@ -76,6 +75,124 @@ check_docker_daemon() {
     fi
 }
 
+JARS_DIR="${SCRIPT_DIR}/target/jars"
+MAVEN_CACHE_DIR="${SCRIPT_DIR}/.build-cache/m2/repository"
+
+# 运行时镜像：dockerfile 路径 | 镜像 tag
+RUNTIME_IMAGE_SPECS=(
+    "iot-gateway/Dockerfile|iot-gateway:latest"
+    "iot-system/iot-system-biz/Dockerfile|iot-module-system-biz:latest"
+    "iot-infra/iot-infra-biz/Dockerfile|iot-module-infra-biz:latest"
+    "iot-device/iot-device-biz/Dockerfile|iot-module-device-biz:latest"
+    "iot-dataset/iot-dataset-biz/Dockerfile|iot-module-dataset-biz:latest"
+    "iot-tdengine/iot-tdengine-biz/Dockerfile|iot-module-tdengine-biz:latest"
+    "iot-file/iot-file-biz/Dockerfile|iot-module-file-biz:latest"
+    "iot-message/iot-message-biz/Dockerfile|iot-module-message-biz:latest"
+    "iot-sink/iot-sink-biz/Dockerfile|iot-sink-biz:latest"
+    "iot-gb28181/iot-gb28181-biz/Dockerfile|iot-gb28181-biz:latest"
+)
+
+check_jars_exist() {
+    if [ ! -d "$JARS_DIR" ]; then
+        return 1
+    fi
+    find "$JARS_DIR" -maxdepth 1 -name "*.jar" -type f 2>/dev/null | grep -q .
+}
+
+# 第一阶段：Maven 只编译一次，依赖写入 .build-cache/m2/repository，Jar 提取到 target/jars
+build_base_jars() {
+    local force="${1:-0}"
+
+    print_info "========== 第一阶段：Maven 编译（Dockerfile.base）=========="
+
+    if [ "$force" != "1" ] && check_jars_exist; then
+        local jar_count
+        jar_count=$(find "$JARS_DIR" -maxdepth 1 -name "*.jar" -type f 2>/dev/null | wc -l)
+        print_success "Jar 已存在于 $JARS_DIR（$jar_count 个），跳过 Maven 编译"
+        echo
+        return 0
+    fi
+
+    check_compose_file
+    check_docker_daemon
+    cd "$SCRIPT_DIR"
+    init_project_build_cache_dirs "$SCRIPT_DIR"
+    enable_docker_buildkit
+
+    mkdir -p "$JARS_DIR"
+    print_info "Maven 本地仓库: $MAVEN_CACHE_DIR"
+
+    print_info "构建 device-base-builder（mvn 仅执行一次）..."
+    if ! docker build -f Dockerfile.base --target output -t device-base-builder:latest .; then
+        print_error "Dockerfile.base 构建失败"
+        exit 1
+    fi
+
+    print_info "提取 Jar 到 $JARS_DIR ..."
+    local temp_container="device-base-builder-temp-$(date +%s)"
+    if ! docker create --name "$temp_container" device-base-builder:latest >/dev/null 2>&1; then
+        print_error "创建临时容器失败"
+        exit 1
+    fi
+    if ! docker cp "${temp_container}:/target/jars/." "$JARS_DIR/"; then
+        docker rm -f "$temp_container" >/dev/null 2>&1 || true
+        print_error "复制 Jar 失败"
+        exit 1
+    fi
+    docker rm -f "$temp_container" >/dev/null 2>&1 || true
+
+    local jar_count=0
+    while IFS= read -r jar_file; do
+        [ -f "$jar_file" ] || continue
+        jar_count=$((jar_count + 1))
+        print_success "  ✓ $(basename "$jar_file")"
+    done < <(find "$JARS_DIR" -maxdepth 1 -name "*.jar" -type f 2>/dev/null | sort)
+
+    if [ "$jar_count" -eq 0 ]; then
+        print_error "未找到任何 Jar，请检查 Dockerfile.base 编译日志"
+        exit 1
+    fi
+
+    print_success "========== 第一阶段完成（共 $jar_count 个 Jar）=========="
+    echo
+}
+
+# 第二阶段：仅打包运行时镜像（COPY target/jars，不再执行 Maven）
+build_runtime_images() {
+    local force="${1:-0}"
+
+    print_info "========== 第二阶段：构建运行时镜像 ==========="
+
+    if [ "$force" != "1" ] && check_images_exist; then
+        print_success "所有运行时镜像已存在，跳过第二阶段"
+        echo
+        return 0
+    fi
+
+    if ! check_jars_exist; then
+        print_warning "未找到 Jar，先执行第一阶段..."
+        build_base_jars 1
+    fi
+
+    check_compose_file
+    check_docker_daemon
+    cd "$SCRIPT_DIR"
+
+    local spec dockerfile tag
+    for spec in "${RUNTIME_IMAGE_SPECS[@]}"; do
+        dockerfile="${spec%%|*}"
+        tag="${spec##*|}"
+        print_info "构建运行时镜像: $tag ($dockerfile)"
+        if ! docker build -f "$dockerfile" -t "$tag" .; then
+            print_error "构建失败: $tag"
+            exit 1
+        fi
+    done
+
+    print_success "========== 第二阶段完成 ==========="
+    echo
+}
+
 # 检查所有运行时镜像是否已存在
 check_images_exist() {
     local images=(
@@ -122,72 +239,17 @@ build_images() {
     check_compose_file
     check_docker_daemon
     
-    cd "$SCRIPT_DIR"
-    init_project_build_cache_dirs "$SCRIPT_DIR"
-    enable_docker_buildkit
-    
-    print_info "构建所有运行时镜像（Maven 仓库: .build-cache/m2/repository）..."
-    local exit_code
-    
-    print_info "使用 docker build 构建所有服务镜像..."
-    docker build --target iot-gateway -t iot-gateway:latest . && \
-    docker build --target iot-system -t iot-module-system-biz:latest . && \
-    docker build --target iot-infra -t iot-module-infra-biz:latest . && \
-    docker build --target iot-device -t iot-module-device-biz:latest . && \
-    docker build --target iot-dataset -t iot-module-dataset-biz:latest . && \
-    docker build --target iot-tdengine -t iot-module-tdengine-biz:latest . && \
-    docker build --target iot-file -t iot-module-file-biz:latest . && \
-    docker build --target iot-message -t iot-module-message-biz:latest . && \
-    docker build --target iot-sink -t iot-sink-biz:latest . && \
-    docker build --target iot-gb28181 -t iot-gb28181-biz:latest .
-    exit_code=$?
-    
-    # 检查命令是否成功
-    if [ $exit_code -ne 0 ]; then
-        print_error "运行时镜像构建失败（退出码: $exit_code）"
-        exit 1
-    fi
-    
-    print_success "========== 所有运行时镜像构建完成 =========="
-    echo
+    build_base_jars 0
+    build_runtime_images 0
 }
 
-# 强制重新构建所有镜像（不检查镜像是否存在，用于 install 命令）
+# 强制重新构建（install / update）
 build_images_force() {
-    print_info "========== 强制重新构建所有运行时镜像 =========="
-    
-    # 确保权限正确
+    print_info "========== 强制重新构建（两阶段）=========="
     check_compose_file
     check_docker_daemon
-    
-    cd "$SCRIPT_DIR"
-    init_project_build_cache_dirs "$SCRIPT_DIR"
-    enable_docker_buildkit
-    
-    print_info "强制重新构建所有运行时镜像（Maven: .build-cache/m2/repository）..."
-    local exit_code
-    
-    print_info "使用 docker build 构建所有服务镜像..."
-    docker build --target iot-gateway -t iot-gateway:latest . && \
-    docker build --target iot-system -t iot-module-system-biz:latest . && \
-    docker build --target iot-infra -t iot-module-infra-biz:latest . && \
-    docker build --target iot-device -t iot-module-device-biz:latest . && \
-    docker build --target iot-dataset -t iot-module-dataset-biz:latest . && \
-    docker build --target iot-tdengine -t iot-module-tdengine-biz:latest . && \
-    docker build --target iot-file -t iot-module-file-biz:latest . && \
-    docker build --target iot-message -t iot-module-message-biz:latest . && \
-    docker build --target iot-sink -t iot-sink-biz:latest . && \
-    docker build --target iot-gb28181 -t iot-gb28181-biz:latest .
-    exit_code=$?
-    
-    # 检查命令是否成功
-    if [ $exit_code -ne 0 ]; then
-        print_error "运行时镜像构建失败（退出码: $exit_code）"
-        exit 1
-    fi
-    
-    print_success "========== 所有运行时镜像构建完成 =========="
-    echo
+    build_base_jars 1
+    build_runtime_images 1
 }
 
 # 构建并启动所有服务
@@ -264,6 +326,8 @@ build_and_start() {
     print_success "========== 服务构建并启动完成 =========="
     print_success "服务构建并启动完成（共 $container_count 个容器）"
     echo
+    print_info "Jar 包: $JARS_DIR"
+    print_info "Maven 缓存: $MAVEN_CACHE_DIR"
     print_info "可以使用以下命令查看服务状态:"
     print_info "  $0 status"
     print_info "  $0 logs [服务名]"
@@ -459,23 +523,8 @@ update_services() {
     check_compose_file
     check_docker_daemon
     
-    cd "$SCRIPT_DIR"
-    init_project_build_cache_dirs "$SCRIPT_DIR"
-    enable_docker_buildkit
-    
-    print_info "重新构建运行时镜像（Maven: .build-cache/m2/repository）..."
-    print_info "使用 docker build 构建所有服务镜像..."
-    docker build --target iot-gateway -t iot-gateway:latest . && \
-    docker build --target iot-system -t iot-module-system-biz:latest . && \
-    docker build --target iot-infra -t iot-module-infra-biz:latest . && \
-    docker build --target iot-device -t iot-module-device-biz:latest . && \
-    docker build --target iot-dataset -t iot-module-dataset-biz:latest . && \
-    docker build --target iot-tdengine -t iot-module-tdengine-biz:latest . && \
-    docker build --target iot-file -t iot-module-file-biz:latest . && \
-    docker build --target iot-message -t iot-module-message-biz:latest . && \
-    docker build --target iot-sink -t iot-sink-biz:latest . && \
-    docker build --target iot-gb28181 -t iot-gb28181-biz:latest .
-    
+    build_images_force
+
     # 重启所有服务
     print_info "重启所有服务..."
     local exit_code
@@ -511,12 +560,13 @@ DEVICE模块 Docker Compose 管理脚本
 
 用法: $0 [命令] [选项]
 
-构建流程:
-    使用统一的多阶段构建 Dockerfile，在一个构建过程中完成所有服务的编译和镜像构建
-    所有服务共享同一个构建阶段，提高构建效率
+构建流程（两阶段，与最初设计一致）:
+    1) Dockerfile.base：Maven 只编译一次，依赖缓存到 .build-cache/m2/repository，Jar 落到 target/jars
+    2) 各模块 Dockerfile：仅从 target/jars 打运行时镜像，不再执行 Maven
 
 命令:
-    build               构建所有运行时镜像
+    build-base          仅第一阶段（Maven 编译 + 提取 Jar）
+    build               两阶段（Jar 已存在则跳过第一阶段）
     start               启动所有服务
     stop                停止所有服务
     restart             重启所有服务
@@ -560,6 +610,9 @@ main() {
     check_compose_file
     
     case "${1:-}" in
+        build-base)
+            build_base_jars 1
+            ;;
         build)
             build_images
             ;;
